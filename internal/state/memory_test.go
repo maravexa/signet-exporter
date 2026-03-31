@@ -496,6 +496,132 @@ func TestConcurrency(t *testing.T) {
 	// No panic, no race — test passes
 }
 
+func TestUpdateHost_MACChangeCount(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryStore()
+	ip := "10.0.9.1"
+
+	// Initial insert — no MAC change yet.
+	if err := m.UpdateHost(ctx, makeTestRecord(ip, "aa:00:00:00:00:01")); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.GetHost(ctx, netip.MustParseAddr(ip))
+	if got.MACChangeCount != 0 {
+		t.Errorf("initial MACChangeCount = %d, want 0", got.MACChangeCount)
+	}
+
+	// First MAC change.
+	rec2 := makeTestRecord(ip, "aa:00:00:00:00:02")
+	rec2.LastSeen = time.Now().Add(time.Second)
+	if err := m.UpdateHost(ctx, rec2); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetHost(ctx, netip.MustParseAddr(ip))
+	if got.MACChangeCount != 1 {
+		t.Errorf("after 1st change MACChangeCount = %d, want 1", got.MACChangeCount)
+	}
+
+	// Second MAC change.
+	rec3 := makeTestRecord(ip, "aa:00:00:00:00:03")
+	rec3.LastSeen = time.Now().Add(2 * time.Second)
+	if err := m.UpdateHost(ctx, rec3); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetHost(ctx, netip.MustParseAddr(ip))
+	if got.MACChangeCount != 2 {
+		t.Errorf("after 2nd change MACChangeCount = %d, want 2", got.MACChangeCount)
+	}
+
+	// Same MAC update — count must not change.
+	rec4 := makeTestRecord(ip, "aa:00:00:00:00:03")
+	rec4.LastSeen = time.Now().Add(3 * time.Second)
+	if err := m.UpdateHost(ctx, rec4); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetHost(ctx, netip.MustParseAddr(ip))
+	if got.MACChangeCount != 2 {
+		t.Errorf("same-MAC update should not increment count: got %d, want 2", got.MACChangeCount)
+	}
+}
+
+func TestRecordScanMeta(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryStore()
+	subnet := mustParsePrefix("10.0.8.0/24")
+
+	meta := ScanMeta{
+		Subnet:    subnet,
+		Scanner:   "arp",
+		Duration:  1500 * time.Millisecond,
+		Timestamp: time.Unix(1700000000, 0),
+	}
+	if err := m.RecordScanMeta(ctx, meta); err != nil {
+		t.Fatalf("RecordScanMeta: %v", err)
+	}
+
+	got, err := m.GetScanMeta(ctx, subnet)
+	if err != nil {
+		t.Fatalf("GetScanMeta: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 meta entry, got %d", len(got))
+	}
+	if got[0].Scanner != "arp" {
+		t.Errorf("scanner = %q, want %q", got[0].Scanner, "arp")
+	}
+	if got[0].Duration != 1500*time.Millisecond {
+		t.Errorf("duration = %v, want 1.5s", got[0].Duration)
+	}
+
+	// Overwrite with updated duration.
+	meta2 := ScanMeta{
+		Subnet:    subnet,
+		Scanner:   "arp",
+		Duration:  2 * time.Second,
+		Timestamp: time.Unix(1700000100, 0),
+	}
+	if err := m.RecordScanMeta(ctx, meta2); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetScanMeta(ctx, subnet)
+	if len(got) != 1 {
+		t.Fatalf("after overwrite: expected 1 entry, got %d", len(got))
+	}
+	if got[0].Duration != 2*time.Second {
+		t.Errorf("after overwrite: duration = %v, want 2s", got[0].Duration)
+	}
+
+	// Second scanner for same subnet.
+	meta3 := ScanMeta{
+		Subnet:    subnet,
+		Scanner:   "icmp",
+		Duration:  500 * time.Millisecond,
+		Timestamp: time.Unix(1700000200, 0),
+	}
+	if err := m.RecordScanMeta(ctx, meta3); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetScanMeta(ctx, subnet)
+	if len(got) != 2 {
+		t.Errorf("two scanners: expected 2 entries, got %d", len(got))
+	}
+}
+
+func TestGetScanMeta_NotFound(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryStore()
+	got, err := m.GetScanMeta(ctx, mustParsePrefix("192.168.99.0/24"))
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if got == nil {
+		t.Error("GetScanMeta should return empty slice, not nil")
+	}
+	if len(got) != 0 {
+		t.Errorf("expected 0 entries, got %d", len(got))
+	}
+}
+
 // --- helpers ---
 
 // incrementMAC returns a trivially different MAC string to avoid collisions in multi-insert tests.
