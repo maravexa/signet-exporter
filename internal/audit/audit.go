@@ -1,3 +1,4 @@
+// Package audit provides a structured JSON audit logger for security-relevant events.
 package audit
 
 import (

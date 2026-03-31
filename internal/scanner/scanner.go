@@ -1,3 +1,4 @@
+// Package scanner defines the Scanner interface and types used by all probe implementations.
 package scanner
 
 import (
