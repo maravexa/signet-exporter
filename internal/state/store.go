@@ -24,6 +24,13 @@ type Store interface {
 	// RecentChanges returns all MAC-IP change events since the given time.
 	RecentChanges(ctx context.Context, since time.Time) ([]MACIPChange, error)
 
+	// RecordScanMeta stores timing metadata for the most recent scan of a subnet/scanner pair.
+	RecordScanMeta(ctx context.Context, meta ScanMeta) error
+
+	// GetScanMeta returns all scan metadata entries for the given subnet.
+	// Returns an empty slice (not an error) if no metadata has been recorded yet.
+	GetScanMeta(ctx context.Context, subnet netip.Prefix) ([]ScanMeta, error)
+
 	// Close releases any resources held by the store.
 	Close() error
 }

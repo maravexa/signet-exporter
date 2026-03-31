@@ -52,6 +52,18 @@ func (b *BoltStore) RecentChanges(_ context.Context, _ time.Time) ([]MACIPChange
 	return nil, nil
 }
 
+// RecordScanMeta is not yet implemented for the bbolt backend.
+func (b *BoltStore) RecordScanMeta(_ context.Context, _ ScanMeta) error {
+	// TODO: implement bbolt-backed scan metadata persistence
+	return nil
+}
+
+// GetScanMeta is not yet implemented for the bbolt backend.
+func (b *BoltStore) GetScanMeta(_ context.Context, _ netip.Prefix) ([]ScanMeta, error) {
+	// TODO: implement bbolt-backed scan metadata retrieval
+	return []ScanMeta{}, nil
+}
+
 // Close closes the underlying bbolt database.
 func (b *BoltStore) Close() error {
 	return b.db.Close()

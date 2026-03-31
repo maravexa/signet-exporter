@@ -1,7 +1,8 @@
-// Package server provides the mTLS HTTP server for the /metrics endpoint.
+// Package server provides the HTTP(S) server for the /metrics, /health, and /ready endpoints.
 package server
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -13,13 +14,17 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// NewServer constructs an *http.Server wired with the /metrics, /health, and /ready endpoints.
-// TLS (and optionally mTLS) is configured according to cfg.TLS.
-func NewServer(cfg *config.Config, collector prometheus.Collector) (*http.Server, error) {
+// Server wraps an http.Server and knows whether TLS is configured.
+type Server struct {
+	httpServer *http.Server
+	tlsEnabled bool
+}
+
+// NewHandler creates the HTTP handler with /metrics, /health, and /ready endpoints.
+// It can be used directly in tests via httptest.NewServer without TLS setup.
+func NewHandler(col prometheus.Collector, ready <-chan struct{}) http.Handler {
 	registry := prometheus.NewRegistry()
-	if err := registry.Register(collector); err != nil {
-		return nil, fmt.Errorf("server: register collector: %w", err)
-	}
+	registry.MustRegister(col)
 
 	mux := http.NewServeMux()
 
@@ -28,41 +33,82 @@ func NewServer(cfg *config.Config, collector prometheus.Collector) (*http.Server
 	}))
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
-		// TODO: gate on first scan completion flag once scheduler exposes it.
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
+		w.Header().Set("Content-Type", "application/json")
+		select {
+		case <-ready:
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"ready"}`))
+		default:
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"not ready","reason":"initial scan not complete"}`))
+		}
 	})
 
-	srv := &http.Server{
+	return mux
+}
+
+// NewServer constructs a Server wired with the /metrics, /health, and /ready endpoints.
+// TLS (and optionally mTLS) is configured according to cfg.TLS.
+// If no TLS certificate is configured, the server operates in plaintext HTTP mode.
+func NewServer(cfg *config.Config, col prometheus.Collector, ready <-chan struct{}) (*Server, error) {
+	handler := NewHandler(col, ready)
+
+	httpSrv := &http.Server{
 		Addr:    cfg.ListenAddress,
-		Handler: mux,
+		Handler: handler,
 	}
 
-	// Configure TLS only when a certificate is provided.
+	tlsEnabled := false
 	if cfg.TLS.CertFile != "" {
 		tlsCfg, err := buildTLSConfig(&cfg.TLS)
 		if err != nil {
 			return nil, fmt.Errorf("server: build TLS config: %w", err)
 		}
-		srv.TLSConfig = tlsCfg
+		httpSrv.TLSConfig = tlsCfg
+		tlsEnabled = true
 	}
 
-	return srv, nil
+	return &Server{httpServer: httpSrv, tlsEnabled: tlsEnabled}, nil
 }
+
+// Start begins serving. Uses HTTPS when TLS is configured, otherwise plain HTTP.
+// Returns http.ErrServerClosed after a successful Shutdown call.
+func (s *Server) Start() error {
+	if s.tlsEnabled {
+		// Certificate is pre-loaded in TLSConfig.Certificates; empty strings are intentional.
+		return s.httpServer.ListenAndServeTLS("", "")
+	}
+	return s.httpServer.ListenAndServe()
+}
+
+// Shutdown gracefully stops the server, waiting for active connections to drain.
+func (s *Server) Shutdown(ctx context.Context) error {
+	return s.httpServer.Shutdown(ctx)
+}
+
+// TLSEnabled reports whether the server is configured for HTTPS.
+func (s *Server) TLSEnabled() bool { return s.tlsEnabled }
 
 func buildTLSConfig(cfg *config.TLSConfig) (*tls.Config, error) {
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS13,
 	}
-
 	if cfg.MinVersion == "1.2" {
 		tlsCfg.MinVersion = tls.VersionTLS12
 	}
+
+	// Pre-load the certificate so ListenAndServeTLS("", "") works correctly.
+	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load certificate pair: %w", err)
+	}
+	tlsCfg.Certificates = []tls.Certificate{cert}
 
 	if cfg.ClientCAFile != "" {
 		pool, err := loadCertPool(cfg.ClientCAFile)

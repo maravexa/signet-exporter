@@ -16,6 +16,7 @@ type MemoryStore struct {
 	macIndex   map[string][]netip.Addr    // reverse index: MAC string → IPs
 	changes    []MACIPChange              // append-only ring buffer of MAC-IP binding changes
 	maxChanges int                        // ring buffer capacity
+	scanMeta   map[string]ScanMeta        // key: subnet.String() + "/" + scanner
 }
 
 // MemoryStoreOption is a functional option for MemoryStore.
@@ -35,6 +36,7 @@ func NewMemoryStore(opts ...MemoryStoreOption) *MemoryStore {
 		macIndex:   make(map[string][]netip.Addr),
 		changes:    make([]MACIPChange, 0),
 		maxChanges: 10000,
+		scanMeta:   make(map[string]ScanMeta),
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -137,6 +139,7 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 	existing.Vendor = record.Vendor
 	existing.Authorized = record.Authorized
 	existing.Alive = record.Alive
+	existing.MACChangeCount++
 
 	return nil
 }
@@ -217,6 +220,42 @@ func (m *MemoryStore) RecentChanges(_ context.Context, since time.Time) ([]MACIP
 // Close is a no-op for the in-memory store.
 func (m *MemoryStore) Close() error {
 	return nil
+}
+
+// RecordScanMeta stores timing metadata for a subnet/scanner pair.
+// ErrorCount is maintained as a cumulative monotonic counter: it is preserved
+// across updates and incremented when meta.Error is true.
+func (m *MemoryStore) RecordScanMeta(_ context.Context, meta ScanMeta) error {
+	key := meta.Subnet.String() + "/" + meta.Scanner
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Preserve and optionally increment the cumulative error count.
+	if existing, ok := m.scanMeta[key]; ok {
+		meta.ErrorCount = existing.ErrorCount
+	}
+	if meta.Error {
+		meta.ErrorCount++
+	}
+
+	m.scanMeta[key] = meta
+	return nil
+}
+
+// GetScanMeta returns all scan metadata entries recorded for the given subnet.
+// Returns an empty slice (not an error) if no metadata has been recorded yet.
+func (m *MemoryStore) GetScanMeta(_ context.Context, subnet netip.Prefix) ([]ScanMeta, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	prefix := subnet.String() + "/"
+	result := make([]ScanMeta, 0)
+	for key, meta := range m.scanMeta {
+		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
+			result = append(result, meta)
+		}
+	}
+	return result, nil
 }
 
 // HostCount returns the total number of tracked hosts.
