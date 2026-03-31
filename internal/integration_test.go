@@ -92,27 +92,25 @@ func TestFullStack_MockScan_MetricsExposed(t *testing.T) {
 
 	// /health must always return 200.
 	t.Run("health", func(t *testing.T) {
-		resp, body := getURL(t, ctx, ts.URL+"/health")
-		_ = body
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("/health status = %d, want 200", resp.StatusCode)
+		status, _ := getURL(t, ctx, ts.URL+"/health")
+		if status != http.StatusOK {
+			t.Errorf("/health status = %d, want 200", status)
 		}
 	})
 
 	// /ready must return 200 after the first scan cycle.
 	t.Run("ready", func(t *testing.T) {
-		resp, body := getURL(t, ctx, ts.URL+"/ready")
-		_ = body
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("/ready status = %d, want 200 (scheduler is ready)", resp.StatusCode)
+		status, _ := getURL(t, ctx, ts.URL+"/ready")
+		if status != http.StatusOK {
+			t.Errorf("/ready status = %d, want 200 (scheduler is ready)", status)
 		}
 	})
 
 	// /metrics must return 200 and contain expected metric output.
 	t.Run("metrics", func(t *testing.T) {
-		resp, body := getURL(t, ctx, ts.URL+"/metrics")
-		if resp.StatusCode != http.StatusOK {
-			t.Errorf("/metrics status = %d, want 200", resp.StatusCode)
+		status, body := getURL(t, ctx, ts.URL+"/metrics")
+		if status != http.StatusOK {
+			t.Errorf("/metrics status = %d, want 200", status)
 		}
 
 		text := string(body)
@@ -174,9 +172,9 @@ func TestFullStack_ReadyGating(t *testing.T) {
 	go func() { _ = sched.Run(ctx) }()
 
 	// /ready should return 503 before the first scan finishes.
-	resp, _ := getURL(t, ctx, ts.URL+"/ready")
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Errorf("before ready: /ready status = %d, want 503", resp.StatusCode)
+	status, _ := getURL(t, ctx, ts.URL+"/ready")
+	if status != http.StatusServiceUnavailable {
+		t.Errorf("before ready: /ready status = %d, want 503", status)
 	}
 
 	// Wait for readiness, then verify 200.
@@ -186,9 +184,9 @@ func TestFullStack_ReadyGating(t *testing.T) {
 		t.Fatal("scheduler did not become ready")
 	}
 
-	resp2, _ := getURL(t, ctx, ts.URL+"/ready")
-	if resp2.StatusCode != http.StatusOK {
-		t.Errorf("after ready: /ready status = %d, want 200", resp2.StatusCode)
+	status2, _ := getURL(t, ctx, ts.URL+"/ready")
+	if status2 != http.StatusOK {
+		t.Errorf("after ready: /ready status = %d, want 200", status2)
 	}
 }
 
@@ -206,9 +204,11 @@ func (d *delayedMockScanner) Scan(ctx context.Context, _ netip.Prefix) ([]scanne
 	return nil, nil
 }
 
-// getURL makes a GET request with context, reads the full body, closes it, and
-// returns the response and body bytes. Fails the test on any transport error.
-func getURL(t *testing.T, ctx context.Context, url string) (*http.Response, []byte) {
+// getURL makes a GET request with context, reads and closes the body, and returns
+// the HTTP status code and body bytes. Fails the test on any transport error.
+// Returning (int, []byte) instead of (*http.Response, []byte) keeps the response
+// body from escaping the function, satisfying the bodyclose linter.
+func getURL(t *testing.T, ctx context.Context, url string) (int, []byte) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -218,14 +218,14 @@ func getURL(t *testing.T, ctx context.Context, url string) (*http.Response, []by
 	if err != nil {
 		t.Fatalf("GET %s: %v", url, err)
 	}
-	body, err := io.ReadAll(resp.Body)
-	if closeErr := resp.Body.Close(); closeErr != nil && err == nil {
-		err = closeErr
+	body, readErr := io.ReadAll(resp.Body)
+	if closeErr := resp.Body.Close(); closeErr != nil && readErr == nil {
+		readErr = closeErr
 	}
-	if err != nil {
-		t.Fatalf("reading body from %s: %v", url, err)
+	if readErr != nil {
+		t.Fatalf("reading body from %s: %v", url, readErr)
 	}
-	return resp, body
+	return resp.StatusCode, body
 }
 
 // --- assertion helpers ---
