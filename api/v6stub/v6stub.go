@@ -21,6 +21,7 @@ type NDPEntry struct {
 // NDPState describes the reachability state of a neighbor cache entry.
 type NDPState string
 
+// NDPState* constants enumerate the possible NDP neighbor cache reachability states.
 const (
 	NDPStateReachable  NDPState = "REACHABLE"
 	NDPStateStale      NDPState = "STALE"

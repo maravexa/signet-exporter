@@ -1,3 +1,4 @@
+// Package state provides types and interfaces for tracking host inventory state.
 package state
 
 import (
@@ -6,8 +7,8 @@ import (
 	"time"
 )
 
-// StateStore defines the interface for persisting and querying host inventory state.
-type StateStore interface {
+// Store defines the interface for persisting and querying host inventory state.
+type Store interface {
 	// UpdateHost inserts or updates a host record.
 	UpdateHost(ctx context.Context, record HostRecord) error
 

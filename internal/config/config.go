@@ -1,3 +1,4 @@
+// Package config defines the configuration structure and loader for signet-exporter.
 package config
 
 import (
@@ -9,14 +10,14 @@ import (
 
 // Config is the top-level configuration structure for signet-exporter.
 type Config struct {
-	ListenAddress string        `yaml:"listen_address"`
-	TLS           TLSConfig     `yaml:"tls"`
+	ListenAddress string         `yaml:"listen_address"`
+	TLS           TLSConfig      `yaml:"tls"`
 	Subnets       []SubnetConfig `yaml:"subnets"`
-	DNS           DNSConfig     `yaml:"dns"`
-	Scanner       ScannerConfig `yaml:"scanner"`
-	State         StateConfig   `yaml:"state"`
-	OUIDatabase   string        `yaml:"oui_database"`
-	Audit         AuditConfig   `yaml:"audit"`
+	DNS           DNSConfig      `yaml:"dns"`
+	Scanner       ScannerConfig  `yaml:"scanner"`
+	State         StateConfig    `yaml:"state"`
+	OUIDatabase   string         `yaml:"oui_database"`
+	Audit         AuditConfig    `yaml:"audit"`
 }
 
 // TLSConfig holds TLS and mTLS settings for the metrics endpoint.
@@ -51,7 +52,7 @@ type ScannerConfig struct {
 
 // StateConfig holds configuration for the state persistence backend.
 type StateConfig struct {
-	Backend  string `yaml:"backend"`   // "memory" or "bolt"
+	Backend  string `yaml:"backend"` // "memory" or "bolt"
 	BoltPath string `yaml:"bolt_path"`
 }
 
@@ -99,7 +100,7 @@ func LoadConfig(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	dec := yaml.NewDecoder(f)
 	dec.KnownFields(true)

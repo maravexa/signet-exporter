@@ -1,3 +1,4 @@
+// Package netutil provides shared network utility functions for subnet iteration and IP math.
 package netutil
 
 import (

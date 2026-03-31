@@ -15,7 +15,7 @@ import (
 type Scheduler struct {
 	subnets  []config.SubnetConfig
 	scanners []Scanner
-	store    state.StateStore
+	store    state.Store
 	// semaphore limits the number of concurrent subnet scans in flight.
 	semaphore chan struct{}
 	log       *slog.Logger
@@ -26,7 +26,7 @@ type Scheduler struct {
 func NewScheduler(
 	subnets []config.SubnetConfig,
 	scanners []Scanner,
-	store state.StateStore,
+	store state.Store,
 	maxParallel int,
 	log *slog.Logger,
 ) *Scheduler {

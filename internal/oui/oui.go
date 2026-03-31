@@ -1,3 +1,4 @@
+// Package oui provides an IEEE OUI vendor database parser and lookup.
 package oui
 
 import (
@@ -19,7 +20,7 @@ func LoadFile(path string) (*Database, error) {
 	if err != nil {
 		return nil, fmt.Errorf("oui: open %q: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	db := &Database{entries: make(map[string]string)}
 	scanner := bufio.NewScanner(f)

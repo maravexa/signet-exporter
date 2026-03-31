@@ -11,16 +11,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// SignetCollector implements prometheus.Collector by reading from a StateStore.
+// SignetCollector implements prometheus.Collector by reading from a state.Store.
 type SignetCollector struct {
-	store   state.StateStore
-	cfg     *config.Config
-	log     *slog.Logger
-	descs   map[string]*prometheus.Desc
+	store state.Store
+	cfg   *config.Config
+	log   *slog.Logger
+	descs map[string]*prometheus.Desc
 }
 
 // NewSignetCollector creates a collector wired to the given state store and config.
-func NewSignetCollector(store state.StateStore, cfg *config.Config, log *slog.Logger) *SignetCollector {
+func NewSignetCollector(store state.Store, cfg *config.Config, log *slog.Logger) *SignetCollector {
 	labels := func(keys ...string) []string { return keys }
 
 	descs := map[string]*prometheus.Desc{
