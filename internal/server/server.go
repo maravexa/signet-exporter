@@ -1,3 +1,4 @@
+// Package server provides the mTLS HTTP server for the /metrics endpoint.
 package server
 
 import (

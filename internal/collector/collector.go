@@ -1,3 +1,4 @@
+// Package collector implements the Prometheus metrics collector for signet-exporter.
 package collector
 
 import (
