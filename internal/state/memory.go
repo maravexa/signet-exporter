@@ -222,11 +222,22 @@ func (m *MemoryStore) Close() error {
 	return nil
 }
 
-// RecordScanMeta stores timing metadata for a subnet/scanner pair, overwriting any previous entry.
+// RecordScanMeta stores timing metadata for a subnet/scanner pair.
+// ErrorCount is maintained as a cumulative monotonic counter: it is preserved
+// across updates and incremented when meta.Error is true.
 func (m *MemoryStore) RecordScanMeta(_ context.Context, meta ScanMeta) error {
 	key := meta.Subnet.String() + "/" + meta.Scanner
 	m.mu.Lock()
 	defer m.mu.Unlock()
+
+	// Preserve and optionally increment the cumulative error count.
+	if existing, ok := m.scanMeta[key]; ok {
+		meta.ErrorCount = existing.ErrorCount
+	}
+	if meta.Error {
+		meta.ErrorCount++
+	}
+
 	m.scanMeta[key] = meta
 	return nil
 }

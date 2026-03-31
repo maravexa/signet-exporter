@@ -6,11 +6,18 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/maravexa/signet-exporter/internal/collector"
 	"github.com/maravexa/signet-exporter/internal/config"
+	"github.com/maravexa/signet-exporter/internal/scanner"
+	"github.com/maravexa/signet-exporter/internal/server"
+	"github.com/maravexa/signet-exporter/internal/state"
 	"github.com/maravexa/signet-exporter/internal/version"
 )
 
@@ -22,93 +29,130 @@ func main() {
 	)
 	flag.Parse()
 
-	// Structured JSON logging to stderr.
-	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	}))
-	slog.SetDefault(log)
-
 	if *showVersion {
-		fmt.Printf("signet-exporter version=%s commit=%s date=%s\n",
+		fmt.Printf("signet-exporter %s (commit: %s, built: %s)\n",
 			version.Version, version.Commit, version.Date)
 		os.Exit(0)
 	}
 
+	// Refuse to run as root before loading config: a world-unreadable key file could
+	// mask this check if we attempt TLS setup first.
+	if os.Getuid() == 0 {
+		fmt.Fprintln(os.Stderr, "error: signet-exporter must not run as root — use CAP_NET_RAW capability instead")
+		os.Exit(1)
+	}
+
 	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
-		log.Error("failed to load configuration", "path", *configPath, "err", err)
+		fmt.Fprintf(os.Stderr, "error loading config: %v\n", err)
 		os.Exit(1)
 	}
 
 	if err := config.Validate(cfg); err != nil {
-		log.Error("configuration validation failed", "err", err)
+		fmt.Fprintf(os.Stderr, "configuration invalid: %v\n", err)
 		os.Exit(1)
 	}
 
 	if *validateOnly {
-		fmt.Println("configuration OK")
+		fmt.Println("configuration is valid")
 		os.Exit(0)
 	}
 
-	// Refuse to run as root to enforce least-privilege operation.
-	// (--version and --validate are exempt as they are diagnostic-only.)
-	if os.Getuid() == 0 {
-		log.Error("refusing to run as root; create a dedicated service user (see deploy/signet.sysusers)")
+	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	// Initialize state store.
+	var store state.Store
+	switch cfg.State.Backend {
+	case "memory", "":
+		store = state.NewMemoryStore()
+	case "bolt":
+		// TODO: implement bbolt backend in a future phase.
+		logger.Error("bolt backend not yet implemented, falling back to memory store")
+		store = state.NewMemoryStore()
+	default:
+		logger.Error("unknown state backend", "backend", cfg.State.Backend)
+		os.Exit(1)
+	}
+	defer func() { _ = store.Close() }()
+
+	// Parse subnet CIDRs into typed prefixes for the scanner and collector.
+	subnetConfigs := make([]scanner.SubnetConfig, 0, len(cfg.Subnets))
+	prefixes := make([]netip.Prefix, 0, len(cfg.Subnets))
+	for _, s := range cfg.Subnets {
+		prefix, err := netip.ParsePrefix(s.CIDR)
+		if err != nil {
+			logger.Error("invalid subnet CIDR", "cidr", s.CIDR, "err", err)
+			os.Exit(1)
+		}
+		interval := s.ScanInterval
+		if interval == 0 {
+			interval = 60 * time.Second
+		}
+		subnetConfigs = append(subnetConfigs, scanner.SubnetConfig{
+			Prefix:       prefix,
+			ScanInterval: interval,
+		})
+		prefixes = append(prefixes, prefix)
+	}
+
+	// Build scanner list. Additional scanners (ICMP, DNS, port) will be wired in later phases.
+	scanners := []scanner.Scanner{
+		scanner.NewARPScanner(cfg.Scanner.ARPTimeout, cfg.Scanner.ARPRateLimit, logger),
+	}
+
+	signetCollector := collector.NewSignetCollector(store, prefixes, logger)
+	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger)
+
+	if cfg.TLS.CertFile == "" {
+		logger.Warn("TLS not configured — serving metrics over plaintext HTTP; not recommended for production")
+	}
+
+	srv, err := server.NewServer(cfg, signetCollector, sched.Ready())
+	if err != nil {
+		logger.Error("failed to create server", "err", err)
 		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Graceful shutdown on SIGINT or SIGTERM.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	// Start the scheduler in the background.
 	go func() {
-		sig := <-sigCh
-		log.Info("received shutdown signal", "signal", sig)
-		cancel()
+		if err := sched.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Error("scheduler exited unexpectedly", "err", err)
+		}
 	}()
 
-	log.Info("starting signet-exporter",
+	logger.Info("starting signet-exporter",
 		"version", version.Version,
 		"commit", version.Commit,
-		"listen", cfg.ListenAddress,
+		"address", cfg.ListenAddress,
+		"tls", srv.TLSEnabled(),
+		"subnets", len(cfg.Subnets),
+		"scanners", len(scanners),
 	)
 
-	if err := run(ctx, cfg, log); err != nil {
-		log.Error("fatal error", "err", err)
-		os.Exit(1)
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- srv.Start()
+	}()
+
+	select {
+	case <-ctx.Done():
+		logger.Info("shutdown signal received")
+	case err := <-serverErr:
+		if err != nil && err != http.ErrServerClosed {
+			logger.Error("server error", "err", err)
+		}
 	}
-}
 
-// run is the application entry point after flags and config are resolved.
-// The startup sequence is outlined here; each step will be fleshed out in
-// subsequent development phases.
-func run(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
-	// Step 1: Initialize state store (memory or bbolt).
-	// store, err := initStateStore(cfg)
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer shutdownCancel()
 
-	// Step 2: Initialize OUI database for vendor enrichment.
-	// ouiDB, err := oui.LoadFile(cfg.OUIDatabase)
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		logger.Error("server shutdown error", "err", err)
+	}
 
-	// Step 3: Build scanner implementations (ARP, ICMP, DNS, port).
-	// scanners := buildScanners(cfg)
-
-	// Step 4: Start the scheduler (per-subnet ticker goroutines).
-	// scheduler := scanner.NewScheduler(cfg.Subnets, scanners, store, cfg.Scanner.MaxParallelScans, log)
-	// go scheduler.Run(ctx)
-
-	// Step 5: Initialize the Prometheus collector backed by the state store.
-	// collector := collector.NewSignetCollector(store, cfg, log)
-
-	// Step 6: Start the mTLS metrics server.
-	// srv, err := server.NewServer(cfg, collector)
-	// srv.ListenAndServeTLS(cfg.TLS.CertFile, cfg.TLS.KeyFile)
-
-	log.Info("signet-exporter scaffold ready — no scanners active yet")
-
-	// Block until context is cancelled.
-	<-ctx.Done()
-	log.Info("shutting down")
-	return nil
+	logger.Info("signet-exporter stopped")
 }

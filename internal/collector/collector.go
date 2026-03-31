@@ -41,7 +41,11 @@ type SignetCollector struct {
 }
 
 // NewSignetCollector creates a collector wired to the given state store, subnet list, and logger.
+// If logger is nil, slog.Default() is used.
 func NewSignetCollector(store state.Store, subnets []netip.Prefix, logger *slog.Logger) *SignetCollector {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &SignetCollector{
 		store:   store,
 		subnets: subnets,
@@ -231,6 +235,10 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 			c.logger.Warn("collector: GetScanMeta failed", "subnet", subnetStr, "err", err)
 			continue
 		}
+
+		// signet_last_scan_timestamp has only a `subnet` label, so emit the
+		// most-recent timestamp across all scanners to avoid duplicate label sets.
+		var latestTimestamp time.Time
 		for _, meta := range metas {
 			ch <- prometheus.MustNewConstMetric(
 				c.scanDuration,
@@ -238,10 +246,23 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 				meta.Duration.Seconds(),
 				subnetStr, meta.Scanner,
 			)
+			if meta.Timestamp.After(latestTimestamp) {
+				latestTimestamp = meta.Timestamp
+			}
+			if meta.ErrorCount > 0 {
+				ch <- prometheus.MustNewConstMetric(
+					c.scanErrors,
+					prometheus.CounterValue,
+					float64(meta.ErrorCount),
+					subnetStr, meta.Scanner,
+				)
+			}
+		}
+		if !latestTimestamp.IsZero() {
 			ch <- prometheus.MustNewConstMetric(
 				c.lastScanTimestamp,
 				prometheus.GaugeValue,
-				float64(meta.Timestamp.Unix()),
+				float64(latestTimestamp.Unix()),
 				subnetStr,
 			)
 		}

@@ -38,8 +38,10 @@ type BindingEvent struct {
 
 // ScanMeta holds timing information for the most recent scan of a subnet.
 type ScanMeta struct {
-	Subnet    netip.Prefix
-	Scanner   string
-	Duration  time.Duration
-	Timestamp time.Time
+	Subnet     netip.Prefix
+	Scanner    string
+	Duration   time.Duration
+	Timestamp  time.Time
+	Error      bool   // true if the scan ended with an error
+	ErrorCount uint64 // cumulative count of scan errors for this subnet/scanner pair (never resets)
 }

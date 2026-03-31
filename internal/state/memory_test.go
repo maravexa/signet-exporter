@@ -544,6 +544,48 @@ func TestUpdateHost_MACChangeCount(t *testing.T) {
 	}
 }
 
+func TestRecordScanMeta_ErrorCount(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryStore()
+	subnet := mustParsePrefix("10.0.20.0/24")
+
+	// Successful scan — ErrorCount stays 0.
+	if err := m.RecordScanMeta(ctx, ScanMeta{Subnet: subnet, Scanner: "arp", Error: false}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := m.GetScanMeta(ctx, subnet)
+	if got[0].ErrorCount != 0 {
+		t.Errorf("after success: ErrorCount = %d, want 0", got[0].ErrorCount)
+	}
+
+	// First error — ErrorCount becomes 1.
+	if err := m.RecordScanMeta(ctx, ScanMeta{Subnet: subnet, Scanner: "arp", Error: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetScanMeta(ctx, subnet)
+	if got[0].ErrorCount != 1 {
+		t.Errorf("after 1st error: ErrorCount = %d, want 1", got[0].ErrorCount)
+	}
+
+	// Second error — ErrorCount becomes 2.
+	if err := m.RecordScanMeta(ctx, ScanMeta{Subnet: subnet, Scanner: "arp", Error: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetScanMeta(ctx, subnet)
+	if got[0].ErrorCount != 2 {
+		t.Errorf("after 2nd error: ErrorCount = %d, want 2", got[0].ErrorCount)
+	}
+
+	// Subsequent success — ErrorCount is preserved (not reset).
+	if err := m.RecordScanMeta(ctx, ScanMeta{Subnet: subnet, Scanner: "arp", Error: false}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = m.GetScanMeta(ctx, subnet)
+	if got[0].ErrorCount != 2 {
+		t.Errorf("after success following errors: ErrorCount = %d, want 2 (never reset)", got[0].ErrorCount)
+	}
+}
+
 func TestRecordScanMeta(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemoryStore()
