@@ -29,12 +29,12 @@ func SubnetAddrs(ctx context.Context, prefix netip.Prefix) <-chan netip.Addr {
 			}
 		}
 
-		switch {
-		case hostBits == 0:
+		switch hostBits {
+		case 0:
 			// /32 or /128: single address
 			send(masked.Addr())
 
-		case hostBits == 1:
+		case 1:
 			// /31 or /127: yield both addresses (RFC 3021)
 			addr := masked.Addr()
 			for prefix.Contains(addr) {

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/mdlayher/packet"
+
 	"github.com/maravexa/signet-exporter/pkg/netutil"
 )
 
@@ -67,9 +68,10 @@ func (a *ARPScanner) Scan(ctx context.Context, subnet netip.Prefix) ([]ScanResul
 
 	// Buffer the results channel at min(SubnetSize, 256) to avoid blocking the
 	// listener goroutine while we drain after the scan.
-	bufSize := int(netutil.SubnetSize(subnet))
-	if bufSize > 256 {
-		bufSize = 256
+	sz := netutil.SubnetSize(subnet)
+	bufSize := 256
+	if sz < 256 {
+		bufSize = int(sz)
 	}
 	results := make(chan ScanResult, bufSize)
 
