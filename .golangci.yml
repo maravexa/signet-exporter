@@ -15,7 +15,7 @@ linters:
 
 linters-settings:
   gosec:
-    severity: error
+    severity: high
     confidence: medium
 
   revive:
