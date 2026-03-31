@@ -1,0 +1,89 @@
+version: 2
+
+project_name: signet-exporter
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  # Standard build — linux amd64 and arm64.
+  - id: standard
+    main: ./cmd/signet-exporter
+    binary: signet-exporter
+    goos: [linux]
+    goarch: [amd64, arm64]
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/maravexa/signet-exporter/internal/version.Version={{.Version}}
+      - -X github.com/maravexa/signet-exporter/internal/version.Commit={{.Commit}}
+      - -X github.com/maravexa/signet-exporter/internal/version.Date={{.Date}}
+
+  # FIPS build — linux amd64 only, compiled with BoringCrypto.
+  - id: fips
+    main: ./cmd/signet-exporter
+    binary: signet-exporter-fips
+    goos: [linux]
+    goarch: [amd64]
+    env:
+      - CGO_ENABLED=0
+      - GOEXPERIMENT=boringcrypto
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/maravexa/signet-exporter/internal/version.Version={{.Version}}-fips
+      - -X github.com/maravexa/signet-exporter/internal/version.Commit={{.Commit}}
+      - -X github.com/maravexa/signet-exporter/internal/version.Date={{.Date}}
+
+archives:
+  - id: standard
+    builds: [standard]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format: tar.gz
+    files:
+      - LICENSE
+      - README.md
+      - configs/signet.example.yaml
+
+  - id: fips
+    builds: [fips]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}_fips"
+    format: tar.gz
+    files:
+      - LICENSE
+      - README.md
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+signs:
+  # Placeholder for cosign signing — configure COSIGN_KEY in CI secrets.
+  - cmd: cosign
+    args:
+      - sign-blob
+      - --output-signature=${signature}
+      - --output-certificate=${certificate}
+      - ${artifact}
+    artifacts: checksum
+    output: true
+
+release:
+  github:
+    owner: maravexa
+    name: signet-exporter
+  draft: false
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"

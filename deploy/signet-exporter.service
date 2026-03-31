@@ -1,0 +1,33 @@
+[Unit]
+Description=Signet Prometheus Network Inventory Exporter
+Documentation=https://github.com/maravexa/signet-exporter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=signet
+Group=signet
+ExecStart=/usr/local/bin/signet-exporter --config=/etc/signet/signet.yaml
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/signet
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+# Network capabilities — required for ARP sweep and ICMP probing
+AmbientCapabilities=CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

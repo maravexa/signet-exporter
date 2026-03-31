@@ -1,0 +1,45 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - errcheck
+    - exportloopref
+    - gofumpt
+    - gosec
+    - govet
+    - misspell
+    - noctx
+    - revive
+    - staticcheck
+
+linters-settings:
+  gosec:
+    severity: error
+    confidence: medium
+
+  revive:
+    rules:
+      - name: exported
+      - name: error-return
+      - name: error-strings
+      - name: var-naming
+      - name: package-comments
+
+  gofumpt:
+    extra-rules: true
+
+  staticcheck:
+    checks: ["all"]
+
+issues:
+  exclude-rules:
+    # Stubs with TODO bodies are expected to have unused parameters.
+    - linters: [revive]
+      text: "unused-parameter"
+    # Test files are exempt from some security checks.
+    - path: "_test\\.go"
+      linters: [gosec]
+
+run:
+  timeout: 5m

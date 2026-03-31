@@ -1,0 +1,40 @@
+# Go binaries and build artifacts
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of `go tool cover`
+*.out
+
+# Dependency vendor directory
+vendor/
+
+# Editor and IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# State and database files
+*.db
+*.db-lock
+*.db-shm
+*.db-wal
+
+# TLS keys (never commit private keys)
+*.key
+*.pem
+
+# Local config overrides
+signet.local.yaml
+
+# goreleaser dist output
+dist/

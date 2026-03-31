@@ -1,0 +1,8 @@
+# IEEE OUI database placeholder
+#
+# This file should be replaced with the current IEEE OUI database snapshot.
+# Download from: https://standards-oui.ieee.org/oui/oui.txt
+#
+# Example entry format (tab-separated):
+#   00-00-0C   (hex)   Cisco Systems, Inc
+#   00000C     (base 16)   Cisco Systems, Inc
