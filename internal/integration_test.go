@@ -92,11 +92,8 @@ func TestFullStack_MockScan_MetricsExposed(t *testing.T) {
 
 	// /health must always return 200.
 	t.Run("health", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/health")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
+		resp, body := getURL(t, ctx, ts.URL+"/health")
+		_ = body
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("/health status = %d, want 200", resp.StatusCode)
 		}
@@ -104,11 +101,8 @@ func TestFullStack_MockScan_MetricsExposed(t *testing.T) {
 
 	// /ready must return 200 after the first scan cycle.
 	t.Run("ready", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/ready")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
+		resp, body := getURL(t, ctx, ts.URL+"/ready")
+		_ = body
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("/ready status = %d, want 200 (scheduler is ready)", resp.StatusCode)
 		}
@@ -116,19 +110,11 @@ func TestFullStack_MockScan_MetricsExposed(t *testing.T) {
 
 	// /metrics must return 200 and contain expected metric output.
 	t.Run("metrics", func(t *testing.T) {
-		resp, err := http.Get(ts.URL + "/metrics")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
+		resp, body := getURL(t, ctx, ts.URL+"/metrics")
 		if resp.StatusCode != http.StatusOK {
 			t.Errorf("/metrics status = %d, want 200", resp.StatusCode)
 		}
 
-		body, err := io.ReadAll(resp.Body)
-		if err != nil {
-			t.Fatal(err)
-		}
 		text := string(body)
 
 		assertMetricPresent(t, text, "signet_exporter_build_info")
@@ -188,11 +174,7 @@ func TestFullStack_ReadyGating(t *testing.T) {
 	go func() { _ = sched.Run(ctx) }()
 
 	// /ready should return 503 before the first scan finishes.
-	resp, err := http.Get(ts.URL + "/ready")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
+	resp, _ := getURL(t, ctx, ts.URL+"/ready")
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Errorf("before ready: /ready status = %d, want 503", resp.StatusCode)
 	}
@@ -204,11 +186,7 @@ func TestFullStack_ReadyGating(t *testing.T) {
 		t.Fatal("scheduler did not become ready")
 	}
 
-	resp2, err := http.Get(ts.URL + "/ready")
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp2.Body.Close()
+	resp2, _ := getURL(t, ctx, ts.URL+"/ready")
 	if resp2.StatusCode != http.StatusOK {
 		t.Errorf("after ready: /ready status = %d, want 200", resp2.StatusCode)
 	}
@@ -226,6 +204,28 @@ func (d *delayedMockScanner) Scan(ctx context.Context, _ netip.Prefix) ([]scanne
 		return nil, ctx.Err()
 	}
 	return nil, nil
+}
+
+// getURL makes a GET request with context, reads the full body, closes it, and
+// returns the response and body bytes. Fails the test on any transport error.
+func getURL(t *testing.T, ctx context.Context, url string) (*http.Response, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequestWithContext %s: %v", url, err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if closeErr := resp.Body.Close(); closeErr != nil && err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		t.Fatalf("reading body from %s: %v", url, err)
+	}
+	return resp, body
 }
 
 // --- assertion helpers ---
