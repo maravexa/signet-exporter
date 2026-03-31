@@ -47,6 +47,7 @@ type ScannerConfig struct {
 	MaxParallelScans int           `yaml:"max_parallel_scans"`
 	ICMPTimeout      time.Duration `yaml:"icmp_timeout"`
 	ARPTimeout       time.Duration `yaml:"arp_timeout"`
+	ARPRateLimit     time.Duration `yaml:"arp_rate_limit"`
 	PortTimeout      time.Duration `yaml:"port_timeout"`
 }
 
@@ -77,6 +78,7 @@ func DefaultConfig() *Config {
 			MaxParallelScans: 4,
 			ICMPTimeout:      1 * time.Second,
 			ARPTimeout:       2 * time.Second,
+			ARPRateLimit:     500 * time.Microsecond,
 			PortTimeout:      1 * time.Second,
 		},
 		State: StateConfig{
