@@ -245,10 +245,10 @@ func (m *MemoryStore) SubnetUtilization(subnet netip.Prefix) (used int, total ui
 
 	if addr.Is4() || addr.Is4In6() {
 		hostBits := 32 - bits
-		switch {
-		case hostBits == 0: // /32
+		switch hostBits {
+		case 0: // /32
 			total = 1
-		case hostBits == 1: // /31
+		case 1: // /31
 			total = 2
 		default:
 			total = (uint64(1) << hostBits) - 2
