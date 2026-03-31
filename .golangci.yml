@@ -4,7 +4,6 @@ linters:
   enable:
     - bodyclose
     - errcheck
-    - exportloopref
     - gosec
     - govet
     - misspell
