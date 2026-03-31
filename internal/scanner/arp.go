@@ -179,16 +179,16 @@ func buildARPRequest(srcMAC net.HardwareAddr, srcIP netip.Addr, dstIP netip.Addr
 
 	// Ethernet header
 	copy(frame[0:6], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff}) // dst: broadcast
-	copy(frame[6:12], srcMAC)                                      // src
-	binary.BigEndian.PutUint16(frame[12:14], ethTypeARP)           // EtherType 0x0806
+	copy(frame[6:12], srcMAC) // src
+	binary.BigEndian.PutUint16(frame[12:14], ethTypeARP) // EtherType 0x0806
 
 	// ARP payload
 	binary.BigEndian.PutUint16(frame[14:16], 0x0001) // hardware type: Ethernet
 	binary.BigEndian.PutUint16(frame[16:18], 0x0800) // protocol type: IPv4
-	frame[18] = 6                                    // hardware address length
-	frame[19] = 4                                    // protocol address length
+	frame[18] = 6 // hardware address length
+	frame[19] = 4 // protocol address length
 	binary.BigEndian.PutUint16(frame[20:22], 0x0001) // operation: request
-	copy(frame[22:28], srcMAC)                       // sender hardware address
+	copy(frame[22:28], srcMAC) // sender hardware address
 	s4 := srcIP.As4()
 	copy(frame[28:32], s4[:]) // sender protocol address
 	// target hardware address [32:38] stays all-zeros (unknown)
