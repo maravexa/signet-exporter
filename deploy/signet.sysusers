@@ -1,0 +1,7 @@
+# systemd-sysusers configuration for signet-exporter
+# Install to /usr/lib/sysusers.d/signet.conf and run: systemd-sysusers
+#
+# Creates a dedicated system user and group with no login shell and a locked
+# password, suitable for running signet-exporter under least-privilege.
+
+u signet - "Signet Network Inventory Exporter" /var/lib/signet /sbin/nologin

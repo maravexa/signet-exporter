@@ -1,0 +1,16 @@
+# signet-exporter — minimal working configuration
+# Suitable for local testing. Runs without TLS; binds to loopback only.
+
+listen_address: "127.0.0.1:9420"
+
+subnets:
+  - cidr: "127.0.0.0/8"
+    scan_interval: 60s
+    ports: [22, 80, 443]
+
+state:
+  backend: "memory"
+
+audit:
+  enabled: false
+  output: "stderr"

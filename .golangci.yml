@@ -1,0 +1,32 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose
+    - errcheck
+    - gosec
+    - govet
+    - misspell
+    - noctx
+    - revive
+    - staticcheck
+  settings:
+    gosec:
+      severity: high
+      confidence: medium
+    revive:
+      rules:
+        - name: exported
+        - name: error-return
+        - name: error-strings
+        - name: var-naming
+        - name: package-comments
+    staticcheck:
+      checks: ["all"]
+
+formatters:
+  enable:
+    - gofumpt
+
+run:
+  timeout: 5m
