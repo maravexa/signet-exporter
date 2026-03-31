@@ -23,20 +23,17 @@ linters:
         - name: error-strings
         - name: var-naming
         - name: package-comments
-    gofumpt:
-      extra-rules: true
     staticcheck:
       checks: ["all"]
 
 issues:
-  exclusions:
-    rules:
-      # Stubs with TODO bodies are expected to have unused parameters.
-      - linters: [revive]
-        text: "unused-parameter"
-      # Test files are exempt from some security checks.
-      - path: "_test\\.go"
-        linters: [gosec]
+  exclude-rules:
+    # Stubs with TODO bodies are expected to have unused parameters.
+    - linters: [revive]
+      text: "unused-parameter"
+    # Test files are exempt from some security checks.
+    - path: "_test\\.go"
+      linters: [gosec]
 
 run:
   timeout: 5m
