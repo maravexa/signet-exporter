@@ -7,11 +7,10 @@ on:
 
 permissions:
   contents: write
-  id-token: write  # Required for keyless cosign signing via OIDC.
 
 jobs:
   release:
-    name: goreleaser + SBOM + cosign
+    name: goreleaser + SBOM
     runs-on: ubuntu-latest
 
     steps:
@@ -25,10 +24,6 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-
-      # TODO: Re-enable cosign in Phase 4 (requires COSIGN_YES=true + id-token: write)
-      # - name: Install cosign
-      #   uses: sigstore/cosign-installer@v3
 
       - name: Install syft (SBOM generator)
         uses: anchore/sbom-action/download-syft@v0

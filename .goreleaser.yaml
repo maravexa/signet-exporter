@@ -62,18 +62,6 @@ checksum:
   name_template: "checksums.txt"
   algorithm: sha256
 
-# TODO: Re-enable cosign signing in Phase 4
-# Requires: COSIGN_YES=true env var + id-token: write permission in workflow
-# signs:
-#   - cmd: cosign
-#     args:
-#       - sign-blob
-#       - --output-signature=${signature}
-#       - --output-certificate=${certificate}
-#       - ${artifact}
-#     artifacts: checksum
-#     output: true
-
 release:
   github:
     owner: maravexa
