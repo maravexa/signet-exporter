@@ -36,7 +36,8 @@ jobs:
           args: release --clean --skip=sign
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          COSIGN_YES: "false"
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
+          COSIGN_YES: "true"
 
       - name: Generate SBOM
         run: ./scripts/generate-sbom.sh dist
