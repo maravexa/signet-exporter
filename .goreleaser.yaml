@@ -58,6 +58,16 @@ archives:
       - LICENSE
       - README.md
 
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+
 checksum:
   name_template: "checksums.txt"
   algorithm: sha256
