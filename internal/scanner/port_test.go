@@ -15,7 +15,8 @@ import (
 // Returns the port number and a cleanup function.
 func startTestListener(t *testing.T) (uint16, func()) {
 	t.Helper()
-	l, err := net.Listen("tcp", "0.0.0.0:0")
+	lc := &net.ListenConfig{}
+	l, err := lc.Listen(context.Background(), "tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatalf("failed to start test listener: %v", err)
 	}
@@ -26,12 +27,16 @@ func startTestListener(t *testing.T) (uint16, func()) {
 			if err != nil {
 				return
 			}
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 
-	port := uint16(l.Addr().(*net.TCPAddr).Port)
-	return port, func() { l.Close() }
+	portInt := l.Addr().(*net.TCPAddr).Port
+	if portInt <= 0 || portInt > 65535 {
+		t.Fatalf("listener returned unexpected port %d", portInt)
+	}
+	port := uint16(portInt) //nolint:gosec // bounds checked immediately above
+	return port, func() { _ = l.Close() }
 }
 
 func newTestPortScanner(store state.Store, subnetPorts map[string][]uint16, defaultPorts []uint16) *PortScanner {

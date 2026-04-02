@@ -109,6 +109,7 @@ func (p *PortScanner) Scan(ctx context.Context, subnet netip.Prefix) ([]ScanResu
 	sem := make(chan struct{}, p.maxWorkers)
 	var wg sync.WaitGroup
 
+workLoop:
 	for _, w := range work {
 		if ctx.Err() != nil {
 			break
@@ -121,7 +122,7 @@ func (p *PortScanner) Scan(ctx context.Context, subnet netip.Prefix) ([]ScanResu
 		case sem <- struct{}{}:
 		case <-ctx.Done():
 			wg.Done()
-			break
+			break workLoop
 		}
 
 		go func() {
@@ -181,6 +182,6 @@ func (p *PortScanner) checkPort(ctx context.Context, ip netip.Addr, port uint16)
 	if err != nil {
 		return false
 	}
-	conn.Close()
+	_ = conn.Close()
 	return true
 }
