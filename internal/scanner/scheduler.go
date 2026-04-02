@@ -168,6 +168,7 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 				LastSeen:      r.Timestamp,
 				Hostnames:     r.Hostnames,
 				DNSMismatches: r.DNSMismatches,
+				OpenPorts:     r.OpenPorts,
 			}
 			if err := s.store.UpdateHost(ctx, record); err != nil {
 				s.logger.Warn("failed to update host",
