@@ -50,6 +50,7 @@ type ScannerConfig struct {
 	ARPTimeout       time.Duration `yaml:"arp_timeout"`
 	ARPRateLimit     time.Duration `yaml:"arp_rate_limit"`
 	PortTimeout      time.Duration `yaml:"port_timeout"`
+	PortMaxWorkers   int           `yaml:"port_max_workers"`
 }
 
 // StateConfig holds configuration for the state persistence backend.
@@ -82,6 +83,7 @@ func DefaultConfig() *Config {
 			ARPTimeout:       2 * time.Second,
 			ARPRateLimit:     500 * time.Microsecond,
 			PortTimeout:      1 * time.Second,
+			PortMaxWorkers:   32,
 		},
 		State: StateConfig{
 			Backend:  "memory",

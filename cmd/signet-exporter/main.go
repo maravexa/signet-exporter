@@ -96,12 +96,22 @@ func main() {
 		prefixes = append(prefixes, prefix)
 	}
 
-	// Build scanner list. DNS runs last — it enriches hosts already discovered
-	// by the ARP and ICMP scanners in the same cycle.
+	// Build per-subnet port map from config.
+	subnetPorts := make(map[string][]uint16)
+	for _, s := range cfg.Subnets {
+		if len(s.Ports) > 0 {
+			prefix, _ := netip.ParsePrefix(s.CIDR) // already validated above
+			subnetPorts[prefix.String()] = s.Ports
+		}
+	}
+
+	// Build scanner list. ARP and ICMP discover hosts; DNS enriches hostnames;
+	// port scanner probes open TCP ports — all run sequentially per scan cycle.
 	scanners := []scanner.Scanner{
 		scanner.NewARPScanner(cfg.Scanner.ARPTimeout, cfg.Scanner.ARPRateLimit, logger),
 		scanner.NewICMPScanner(cfg.Scanner.ICMPTimeout, cfg.Scanner.ICMPRateLimit, logger),
 		scanner.NewDNSScanner(store, cfg.DNS.Servers, cfg.DNS.Timeout, logger),
+		scanner.NewPortScanner(store, subnetPorts, nil, cfg.Scanner.PortTimeout, cfg.Scanner.PortMaxWorkers, logger),
 	}
 
 	signetCollector := collector.NewSignetCollector(store, prefixes, logger)

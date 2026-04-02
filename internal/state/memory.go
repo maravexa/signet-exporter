@@ -121,6 +121,10 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 			existing.DNSMismatches = make([]string, len(record.DNSMismatches))
 			copy(existing.DNSMismatches, record.DNSMismatches)
 		}
+		if len(record.OpenPorts) > 0 {
+			existing.OpenPorts = make([]uint16, len(record.OpenPorts))
+			copy(existing.OpenPorts, record.OpenPorts)
+		}
 		return nil
 	}
 
@@ -138,8 +142,10 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 			existing.DNSMismatches = make([]string, len(record.DNSMismatches))
 			copy(existing.DNSMismatches, record.DNSMismatches)
 		}
-		existing.OpenPorts = make([]uint16, len(record.OpenPorts))
-		copy(existing.OpenPorts, record.OpenPorts)
+		if len(record.OpenPorts) > 0 {
+			existing.OpenPorts = make([]uint16, len(record.OpenPorts))
+			copy(existing.OpenPorts, record.OpenPorts)
+		}
 		existing.Vendor = record.Vendor
 		existing.Authorized = record.Authorized
 		existing.Alive = record.Alive
@@ -175,8 +181,10 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 		existing.DNSMismatches = make([]string, len(record.DNSMismatches))
 		copy(existing.DNSMismatches, record.DNSMismatches)
 	}
-	existing.OpenPorts = make([]uint16, len(record.OpenPorts))
-	copy(existing.OpenPorts, record.OpenPorts)
+	if len(record.OpenPorts) > 0 {
+		existing.OpenPorts = make([]uint16, len(record.OpenPorts))
+		copy(existing.OpenPorts, record.OpenPorts)
+	}
 	existing.Vendor = record.Vendor
 	existing.Authorized = record.Authorized
 	existing.Alive = record.Alive

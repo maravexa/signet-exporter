@@ -27,4 +27,5 @@ type ScanResult struct {
 	Metadata      map[string]string
 	Hostnames     []string // populated by the DNS scanner
 	DNSMismatches []string // hostnames where forward lookup didn't resolve back to this IP
+	OpenPorts     []uint16 // populated by the port scanner
 }
