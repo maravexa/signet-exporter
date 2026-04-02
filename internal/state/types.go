@@ -12,6 +12,7 @@ type HostRecord struct {
 	MAC            net.HardwareAddr
 	Vendor         string
 	Hostnames      []string
+	DNSMismatches  []string // hostnames where reverse→forward lookup doesn't resolve back to this IP
 	FirstSeen      time.Time
 	LastSeen       time.Time
 	OpenPorts      []uint16

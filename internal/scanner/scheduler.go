@@ -162,10 +162,12 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 
 		for _, r := range results {
 			record := state.HostRecord{
-				IP:       r.IP,
-				MAC:      r.MAC,
-				Alive:    r.Alive,
-				LastSeen: r.Timestamp,
+				IP:            r.IP,
+				MAC:           r.MAC,
+				Alive:         r.Alive,
+				LastSeen:      r.Timestamp,
+				Hostnames:     r.Hostnames,
+				DNSMismatches: r.DNSMismatches,
 			}
 			if err := s.store.UpdateHost(ctx, record); err != nil {
 				s.logger.Warn("failed to update host",

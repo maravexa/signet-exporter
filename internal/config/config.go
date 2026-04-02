@@ -46,6 +46,7 @@ type DNSConfig struct {
 type ScannerConfig struct {
 	MaxParallelScans int           `yaml:"max_parallel_scans"`
 	ICMPTimeout      time.Duration `yaml:"icmp_timeout"`
+	ICMPRateLimit    time.Duration `yaml:"icmp_rate_limit"`
 	ARPTimeout       time.Duration `yaml:"arp_timeout"`
 	ARPRateLimit     time.Duration `yaml:"arp_rate_limit"`
 	PortTimeout      time.Duration `yaml:"port_timeout"`
@@ -77,6 +78,7 @@ func DefaultConfig() *Config {
 		Scanner: ScannerConfig{
 			MaxParallelScans: 4,
 			ICMPTimeout:      1 * time.Second,
+			ICMPRateLimit:    200 * time.Microsecond,
 			ARPTimeout:       2 * time.Second,
 			ARPRateLimit:     500 * time.Microsecond,
 			PortTimeout:      1 * time.Second,
