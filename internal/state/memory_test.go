@@ -664,6 +664,66 @@ func TestGetScanMeta_NotFound(t *testing.T) {
 	}
 }
 
+// TestUpdateHost_NilMAC_PreservesExisting verifies that an incoming record with
+// a nil MAC (e.g. from an ICMP scan) updates LastSeen but does not overwrite
+// an existing MAC binding established by an earlier ARP scan.
+func TestUpdateHost_NilMAC_PreservesExisting(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryStore()
+
+	mac := "aa:bb:cc:dd:ee:ff"
+	ip := "10.0.1.99"
+
+	// Insert host via simulated ARP result (has MAC).
+	arpRec := makeTestRecord(ip, mac)
+	arpRec.LastSeen = time.Unix(1000, 0)
+	if err := m.UpdateHost(ctx, arpRec); err != nil {
+		t.Fatalf("UpdateHost (ARP): %v", err)
+	}
+
+	// Update same IP via simulated ICMP result (no MAC).
+	icmpRec := HostRecord{
+		IP:       netip.MustParseAddr(ip),
+		MAC:      nil,
+		Alive:    true,
+		LastSeen: time.Unix(2000, 0),
+	}
+	if err := m.UpdateHost(ctx, icmpRec); err != nil {
+		t.Fatalf("UpdateHost (ICMP): %v", err)
+	}
+
+	got, err := m.GetHost(ctx, netip.MustParseAddr(ip))
+	if err != nil {
+		t.Fatalf("GetHost: %v", err)
+	}
+	if got == nil {
+		t.Fatal("expected record, got nil")
+	}
+
+	// MAC must be preserved from the ARP scan.
+	hw, _ := net.ParseMAC(mac)
+	if got.MAC.String() != hw.String() {
+		t.Errorf("MAC = %v, want %v (ICMP update must not clear existing MAC)", got.MAC, hw)
+	}
+
+	// LastSeen must have advanced to the ICMP scan timestamp.
+	if !got.LastSeen.Equal(time.Unix(2000, 0)) {
+		t.Errorf("LastSeen = %v, want %v", got.LastSeen, time.Unix(2000, 0))
+	}
+
+	// No spurious MAC-change event should have been recorded.
+	changes, _ := m.RecentChanges(ctx, time.Unix(0, 0))
+	if len(changes) != 0 {
+		t.Errorf("expected 0 MAC-change events, got %d", len(changes))
+	}
+
+	// macIndex still maps the original MAC to this IP.
+	ips := m.IPsForMAC(hw)
+	if len(ips) != 1 || ips[0] != netip.MustParseAddr(ip) {
+		t.Errorf("IPsForMAC after ICMP update: got %v, want [%v]", ips, ip)
+	}
+}
+
 // --- helpers ---
 
 // incrementMAC returns a trivially different MAC string to avoid collisions in multi-insert tests.

@@ -81,6 +81,8 @@ func copyMACIPChange(c MACIPChange) MACIPChange {
 }
 
 // UpdateHost inserts or updates a host record.
+// If record.MAC is nil or empty (e.g. from an ICMP scan that has no L2 info),
+// the method updates liveness fields but preserves any existing MAC binding.
 func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -93,8 +95,19 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 			r.FirstSeen = r.LastSeen
 		}
 		m.hosts[record.IP] = &r
-		macKey := record.MAC.String()
-		m.macIndex[macKey] = append(m.macIndex[macKey], record.IP)
+		// Only index by MAC when one is present; ICMP results have no MAC.
+		if len(record.MAC) > 0 {
+			macKey := record.MAC.String()
+			m.macIndex[macKey] = append(m.macIndex[macKey], record.IP)
+		}
+		return nil
+	}
+
+	if len(record.MAC) == 0 {
+		// No MAC in incoming record (e.g. ICMP result) — update liveness fields
+		// but preserve the existing MAC binding.
+		existing.LastSeen = record.LastSeen
+		existing.Alive = record.Alive
 		return nil
 	}
 

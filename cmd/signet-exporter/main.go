@@ -96,9 +96,10 @@ func main() {
 		prefixes = append(prefixes, prefix)
 	}
 
-	// Build scanner list. Additional scanners (ICMP, DNS, port) will be wired in later phases.
+	// Build scanner list.
 	scanners := []scanner.Scanner{
 		scanner.NewARPScanner(cfg.Scanner.ARPTimeout, cfg.Scanner.ARPRateLimit, logger),
+		scanner.NewICMPScanner(cfg.Scanner.ICMPTimeout, cfg.Scanner.ICMPRateLimit, logger),
 	}
 
 	signetCollector := collector.NewSignetCollector(store, prefixes, logger)
