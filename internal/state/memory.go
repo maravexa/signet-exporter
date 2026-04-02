@@ -58,6 +58,11 @@ func copyHostRecord(r *HostRecord) HostRecord {
 		copy(out.Hostnames, r.Hostnames)
 	}
 
+	if r.DNSMismatches != nil {
+		out.DNSMismatches = make([]string, len(r.DNSMismatches))
+		copy(out.DNSMismatches, r.DNSMismatches)
+	}
+
 	if r.OpenPorts != nil {
 		out.OpenPorts = make([]uint16, len(r.OpenPorts))
 		copy(out.OpenPorts, r.OpenPorts)
@@ -104,18 +109,35 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 	}
 
 	if len(record.MAC) == 0 {
-		// No MAC in incoming record (e.g. ICMP result) — update liveness fields
-		// but preserve the existing MAC binding.
+		// No MAC in incoming record (e.g. ICMP or DNS result) — update liveness
+		// and enrichment fields but preserve the existing MAC binding.
 		existing.LastSeen = record.LastSeen
 		existing.Alive = record.Alive
+		if len(record.Hostnames) > 0 {
+			existing.Hostnames = make([]string, len(record.Hostnames))
+			copy(existing.Hostnames, record.Hostnames)
+		}
+		if record.DNSMismatches != nil {
+			existing.DNSMismatches = make([]string, len(record.DNSMismatches))
+			copy(existing.DNSMismatches, record.DNSMismatches)
+		}
 		return nil
 	}
 
 	if bytes.Equal(existing.MAC, record.MAC) {
-		// Same MAC — update fields, preserve FirstSeen
+		// Same MAC — update fields, preserve FirstSeen.
 		existing.LastSeen = record.LastSeen
-		existing.Hostnames = make([]string, len(record.Hostnames))
-		copy(existing.Hostnames, record.Hostnames)
+		// Only overwrite Hostnames if the incoming record carries them; an ARP or
+		// ICMP result with no hostname data should not clear DNS-populated names.
+		if len(record.Hostnames) > 0 {
+			existing.Hostnames = make([]string, len(record.Hostnames))
+			copy(existing.Hostnames, record.Hostnames)
+		}
+		// nil means "not checked"; empty slice means "checked, no mismatches".
+		if record.DNSMismatches != nil {
+			existing.DNSMismatches = make([]string, len(record.DNSMismatches))
+			copy(existing.DNSMismatches, record.DNSMismatches)
+		}
 		existing.OpenPorts = make([]uint16, len(record.OpenPorts))
 		copy(existing.OpenPorts, record.OpenPorts)
 		existing.Vendor = record.Vendor
@@ -145,8 +167,14 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 	existing.MAC = make(net.HardwareAddr, len(record.MAC))
 	copy(existing.MAC, record.MAC)
 	existing.LastSeen = record.LastSeen
-	existing.Hostnames = make([]string, len(record.Hostnames))
-	copy(existing.Hostnames, record.Hostnames)
+	if len(record.Hostnames) > 0 {
+		existing.Hostnames = make([]string, len(record.Hostnames))
+		copy(existing.Hostnames, record.Hostnames)
+	}
+	if record.DNSMismatches != nil {
+		existing.DNSMismatches = make([]string, len(record.DNSMismatches))
+		copy(existing.DNSMismatches, record.DNSMismatches)
+	}
 	existing.OpenPorts = make([]uint16, len(record.OpenPorts))
 	copy(existing.OpenPorts, record.OpenPorts)
 	existing.Vendor = record.Vendor

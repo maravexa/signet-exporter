@@ -224,7 +224,15 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 				)
 			}
 
-			// TODO: implement when DNS scanner lands — signet_dns_forward_reverse_mismatch
+			// signet_dns_forward_reverse_mismatch: one sample per mismatched hostname.
+			for _, hostname := range host.DNSMismatches {
+				ch <- prometheus.MustNewConstMetric(
+					c.dnsForwardReverseMismatch,
+					prometheus.GaugeValue,
+					1,
+					ipStr, hostname, subnetStr,
+				)
+			}
 
 			// TODO: implement with duplicate detection logic — signet_duplicate_ip_detected
 		}

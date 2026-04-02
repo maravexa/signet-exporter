@@ -96,10 +96,12 @@ func main() {
 		prefixes = append(prefixes, prefix)
 	}
 
-	// Build scanner list.
+	// Build scanner list. DNS runs last — it enriches hosts already discovered
+	// by the ARP and ICMP scanners in the same cycle.
 	scanners := []scanner.Scanner{
 		scanner.NewARPScanner(cfg.Scanner.ARPTimeout, cfg.Scanner.ARPRateLimit, logger),
 		scanner.NewICMPScanner(cfg.Scanner.ICMPTimeout, cfg.Scanner.ICMPRateLimit, logger),
+		scanner.NewDNSScanner(store, cfg.DNS.Servers, cfg.DNS.Timeout, logger),
 	}
 
 	signetCollector := collector.NewSignetCollector(store, prefixes, logger)

@@ -19,10 +19,12 @@ type Scanner interface {
 
 // ScanResult holds the outcome of probing a single IP address.
 type ScanResult struct {
-	IP        netip.Addr
-	MAC       net.HardwareAddr
-	Alive     bool
-	Source    string // "arp", "icmp", "port", "dns"
-	Timestamp time.Time
-	Metadata  map[string]string
+	IP            netip.Addr
+	MAC           net.HardwareAddr
+	Alive         bool
+	Source        string // "arp", "icmp", "port", "dns"
+	Timestamp     time.Time
+	Metadata      map[string]string
+	Hostnames     []string // populated by the DNS scanner
+	DNSMismatches []string // hostnames where forward lookup didn't resolve back to this IP
 }

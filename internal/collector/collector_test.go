@@ -531,6 +531,64 @@ func TestCollect_ScanMeta(t *testing.T) {
 	}
 }
 
+func TestCollect_DNSMismatch(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.8.0/24"
+
+	rec := makeHost("10.0.8.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.DNSMismatches = []string{"bad.example.com"}
+	})
+	if err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_dns_forward_reverse_mismatch")
+	if fam == nil {
+		t.Fatal("signet_dns_forward_reverse_mismatch not emitted")
+	}
+	s := findSample(fam, map[string]string{
+		"ip":       "10.0.8.1",
+		"hostname": "bad.example.com",
+		"subnet":   subnet,
+	})
+	if s == nil {
+		t.Fatal("no sample for ip/hostname/subnet")
+	}
+	if s.GetGauge().GetValue() != 1.0 {
+		t.Errorf("dns_mismatch value = %v, want 1", s.GetGauge().GetValue())
+	}
+}
+
+func TestCollect_DNSNoMismatch(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.9.0/24"
+
+	// DNSMismatches is non-nil but empty: host was checked, no mismatches found.
+	rec := makeHost("10.0.9.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.DNSMismatches = []string{}
+	})
+	if err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_dns_forward_reverse_mismatch")
+	if fam == nil {
+		return // no family at all — correct
+	}
+	s := findSample(fam, map[string]string{"ip": "10.0.9.1", "subnet": subnet})
+	if s != nil {
+		t.Error("signet_dns_forward_reverse_mismatch emitted for host with no mismatches, want no sample")
+	}
+}
+
 func TestCollect_NoScanMeta_NoEmission(t *testing.T) {
 	store := state.NewMemoryStore()
 	subnet := "10.0.7.0/24"
