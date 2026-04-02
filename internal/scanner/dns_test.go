@@ -255,8 +255,9 @@ func TestDNSScan_MultipleHostnames(t *testing.T) {
 			"10.0.1.1": {"web.example.com.", "server1.example.com."},
 		},
 		aRecords: map[string][]string{
-			"web.example.com":     {"10.0.1.1"},   // consistent
-			"server1.example.com": {"10.0.1.99"},  // mismatch
+			// web.example.com → 10.0.1.1 (consistent), server1 → 10.0.1.99 (mismatch)
+			"web.example.com":     {"10.0.1.1"},
+			"server1.example.com": {"10.0.1.99"},
 		},
 	}
 
