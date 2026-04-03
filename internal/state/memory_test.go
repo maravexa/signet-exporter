@@ -724,6 +724,155 @@ func TestUpdateHost_NilMAC_PreservesExisting(t *testing.T) {
 	}
 }
 
+func TestUpdateHost_DuplicateMACs_Set(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryStore()
+
+	mac1, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	mac2, _ := net.ParseMAC("ff:ee:dd:cc:bb:aa")
+	ip := "10.0.11.1"
+
+	rec := makeTestRecord(ip, mac1.String())
+	rec.DuplicateChecked = true
+	rec.DuplicateMACs = []net.HardwareAddr{mac2}
+	if _, err := m.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := m.GetHost(ctx, netip.MustParseAddr(ip))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DuplicateMACs) != 1 {
+		t.Fatalf("DuplicateMACs len = %d, want 1", len(got.DuplicateMACs))
+	}
+	if got.DuplicateMACs[0].String() != mac2.String() {
+		t.Errorf("DuplicateMACs[0] = %v, want %v", got.DuplicateMACs[0], mac2)
+	}
+}
+
+func TestUpdateHost_DuplicateMACs_Cleared(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryStore()
+
+	mac1, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	mac2, _ := net.ParseMAC("ff:ee:dd:cc:bb:aa")
+	ip := "10.0.11.2"
+
+	// Insert with a duplicate.
+	rec := makeTestRecord(ip, mac1.String())
+	rec.DuplicateChecked = true
+	rec.DuplicateMACs = []net.HardwareAddr{mac2}
+	if _, err := m.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	// Next ARP scan: same IP, same MAC, no duplicate this time.
+	rec2 := makeTestRecord(ip, mac1.String())
+	rec2.DuplicateChecked = true
+	rec2.DuplicateMACs = nil // clean scan
+	if _, err := m.UpdateHost(ctx, rec2); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := m.GetHost(ctx, netip.MustParseAddr(ip))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DuplicateMACs) != 0 {
+		t.Errorf("DuplicateMACs should be cleared after clean scan; got %v", got.DuplicateMACs)
+	}
+}
+
+func TestUpdateHost_DuplicateMACs_Untouched(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryStore()
+
+	mac1, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	mac2, _ := net.ParseMAC("ff:ee:dd:cc:bb:aa")
+	ip := "10.0.11.3"
+
+	// Insert with a duplicate.
+	rec := makeTestRecord(ip, mac1.String())
+	rec.DuplicateChecked = true
+	rec.DuplicateMACs = []net.HardwareAddr{mac2}
+	if _, err := m.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	// DNS scanner update: DuplicateChecked = false — must not touch DuplicateMACs.
+	dnsRec := HostRecord{
+		IP:               netip.MustParseAddr(ip),
+		MAC:              mac1,
+		Alive:            true,
+		LastSeen:         rec.LastSeen.Add(time.Second),
+		Hostnames:        []string{"host.example.com"},
+		DuplicateChecked: false, // DNS doesn't know about duplicates
+	}
+	if _, err := m.UpdateHost(ctx, dnsRec); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := m.GetHost(ctx, netip.MustParseAddr(ip))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.DuplicateMACs) != 1 {
+		t.Errorf("DuplicateMACs should be preserved when DuplicateChecked=false; len=%d", len(got.DuplicateMACs))
+	}
+	if got.DuplicateMACs[0].String() != mac2.String() {
+		t.Errorf("DuplicateMACs[0] = %v, want %v", got.DuplicateMACs[0], mac2)
+	}
+}
+
+func TestUpdateHost_DuplicateDetected_HostChange(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemoryStore()
+
+	mac1, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	mac2, _ := net.ParseMAC("ff:ee:dd:cc:bb:aa")
+	ip := "10.0.11.4"
+
+	// New host with duplicate — DuplicateDetected should be true.
+	rec := makeTestRecord(ip, mac1.String())
+	rec.DuplicateChecked = true
+	rec.DuplicateMACs = []net.HardwareAddr{mac2}
+	change, err := m.UpdateHost(ctx, rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !change.IsNew {
+		t.Error("expected IsNew=true for first insert")
+	}
+	if !change.DuplicateDetected {
+		t.Error("DuplicateDetected should be true when duplicates are present")
+	}
+
+	// Same-MAC update, no duplicate — DuplicateDetected should be false.
+	rec2 := makeTestRecord(ip, mac1.String())
+	rec2.DuplicateChecked = true
+	rec2.DuplicateMACs = nil
+	change2, err := m.UpdateHost(ctx, rec2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if change2.DuplicateDetected {
+		t.Error("DuplicateDetected should be false when no duplicates")
+	}
+
+	// Same-MAC update, duplicate again — DuplicateDetected should be true.
+	rec3 := makeTestRecord(ip, mac1.String())
+	rec3.DuplicateChecked = true
+	rec3.DuplicateMACs = []net.HardwareAddr{mac2}
+	change3, err := m.UpdateHost(ctx, rec3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !change3.DuplicateDetected {
+		t.Error("DuplicateDetected should be true again when duplicates return")
+	}
+}
+
 // --- helpers ---
 
 // incrementMAC returns a trivially different MAC string to avoid collisions in multi-insert tests.

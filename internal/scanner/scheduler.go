@@ -188,13 +188,15 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 
 		for _, r := range results {
 			record := state.HostRecord{
-				IP:            r.IP,
-				MAC:           r.MAC,
-				Alive:         r.Alive,
-				LastSeen:      r.Timestamp,
-				Hostnames:     r.Hostnames,
-				DNSMismatches: r.DNSMismatches,
-				OpenPorts:     r.OpenPorts,
+				IP:               r.IP,
+				MAC:              r.MAC,
+				Alive:            r.Alive,
+				LastSeen:         r.Timestamp,
+				Hostnames:        r.Hostnames,
+				DNSMismatches:    r.DNSMismatches,
+				OpenPorts:        r.OpenPorts,
+				DuplicateMACs:    r.DuplicateMACs,
+				DuplicateChecked: r.DuplicateChecked,
 			}
 			if s.ouiDB != nil && len(r.MAC) >= 3 {
 				record.Vendor = s.ouiDB.Lookup(r.MAC)
@@ -218,6 +220,9 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 				s.auditLog.NewHost(ip, subnetStr, r.MAC, record.Vendor, hostname)
 			} else if change.MACChanged {
 				s.auditLog.MACIPChange(ip, subnetStr, change.OldMAC, r.MAC, change.OldVendor, record.Vendor)
+			}
+			if change.DuplicateDetected {
+				s.auditLog.DuplicateIP(ip, subnetStr, r.MAC, r.DuplicateMACs)
 			}
 		}
 

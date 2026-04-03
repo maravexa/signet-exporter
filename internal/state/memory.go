@@ -68,6 +68,15 @@ func copyHostRecord(r *HostRecord) HostRecord {
 		copy(out.OpenPorts, r.OpenPorts)
 	}
 
+	if r.DuplicateMACs != nil {
+		out.DuplicateMACs = make([]net.HardwareAddr, len(r.DuplicateMACs))
+		for i, mac := range r.DuplicateMACs {
+			dupMAC := make(net.HardwareAddr, len(mac))
+			copy(dupMAC, mac)
+			out.DuplicateMACs[i] = dupMAC
+		}
+	}
+
 	return out
 }
 
@@ -105,7 +114,10 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) (HostChan
 			macKey := record.MAC.String()
 			m.macIndex[macKey] = append(m.macIndex[macKey], record.IP)
 		}
-		return HostChange{IsNew: true}, nil
+		return HostChange{
+			IsNew:             true,
+			DuplicateDetected: record.DuplicateChecked && len(record.DuplicateMACs) > 0,
+		}, nil
 	}
 
 	if len(record.MAC) == 0 {
@@ -151,8 +163,12 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) (HostChan
 			existing.AuthorizationChecked = true
 			existing.Authorized = record.Authorized
 		}
+		if record.DuplicateChecked {
+			existing.DuplicateChecked = true
+			existing.DuplicateMACs = copyDuplicateMACs(record.DuplicateMACs)
+		}
 		existing.Alive = record.Alive
-		return HostChange{}, nil
+		return HostChange{DuplicateDetected: record.DuplicateChecked && len(record.DuplicateMACs) > 0}, nil
 	}
 
 	// Different MAC — binding change. Capture previous state before overwriting.
@@ -200,10 +216,30 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) (HostChan
 		existing.AuthorizationChecked = true
 		existing.Authorized = record.Authorized
 	}
+	if record.DuplicateChecked {
+		existing.DuplicateChecked = true
+		existing.DuplicateMACs = copyDuplicateMACs(record.DuplicateMACs)
+	}
 	existing.Alive = record.Alive
 	existing.MACChangeCount++
+	hostChange.DuplicateDetected = record.DuplicateChecked && len(record.DuplicateMACs) > 0
 
 	return hostChange, nil
+}
+
+// copyDuplicateMACs returns a deep copy of a []net.HardwareAddr slice.
+// Returns nil when the input is nil (preserves nil semantics).
+func copyDuplicateMACs(macs []net.HardwareAddr) []net.HardwareAddr {
+	if macs == nil {
+		return nil
+	}
+	out := make([]net.HardwareAddr, len(macs))
+	for i, mac := range macs {
+		dupMAC := make(net.HardwareAddr, len(mac))
+		copy(dupMAC, mac)
+		out[i] = dupMAC
+	}
+	return out
 }
 
 // appendChange appends to the ring buffer under an already-held write lock.

@@ -20,6 +20,7 @@ const (
 	EventHostDisappeared    EventType = "host_disappeared"
 	EventUnauthorizedDevice EventType = "unauthorized_device"
 	EventScanCycleComplete  EventType = "scan_cycle_complete"
+	EventDuplicateIP        EventType = "duplicate_ip_detected"
 )
 
 // Logger emits structured audit events as one JSON object per line.
@@ -132,6 +133,22 @@ func (l *Logger) UnauthorizedDevice(ip net.IP, subnet string, mac net.HardwareAd
 		slog.String("subnet", subnet),
 		slog.String("mac", mac.String()),
 		slog.String("vendor", vendor),
+	)
+}
+
+// DuplicateIP logs detection of multiple MACs claiming the same IP within one ARP scan window.
+// Fields: event_type, ip, subnet, primary_mac, duplicate_macs (JSON array of MAC strings).
+func (l *Logger) DuplicateIP(ip net.IP, subnet string, primaryMAC net.HardwareAddr, duplicateMACs []net.HardwareAddr) {
+	dupStrs := make([]string, len(duplicateMACs))
+	for i, mac := range duplicateMACs {
+		dupStrs[i] = mac.String()
+	}
+	l.slog.Info("audit",
+		slog.String("event_type", string(EventDuplicateIP)),
+		slog.String("ip", ip.String()),
+		slog.String("subnet", subnet),
+		slog.String("primary_mac", primaryMAC.String()),
+		slog.Any("duplicate_macs", dupStrs),
 	)
 }
 

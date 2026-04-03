@@ -255,6 +255,40 @@ func TestScanCycleComplete_Format(t *testing.T) {
 	}
 }
 
+func TestDuplicateIP_Format(t *testing.T) {
+	var buf bytes.Buffer
+	l := audit.NewLoggerForTest(&buf)
+
+	ip := net.ParseIP("10.0.0.42")
+	primaryMAC, _ := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	dup1, _ := net.ParseMAC("ff:ee:dd:cc:bb:01")
+	dup2, _ := net.ParseMAC("11:22:33:44:55:66")
+	l.DuplicateIP(ip, "10.0.0.0/24", primaryMAC, []net.HardwareAddr{dup1, dup2})
+
+	m := parseFirstLine(t, &buf)
+	assertFieldPresent(t, m, "time")
+	assertField(t, m, "event_type", "duplicate_ip_detected")
+	assertField(t, m, "ip", "10.0.0.42")
+	assertField(t, m, "subnet", "10.0.0.0/24")
+	assertField(t, m, "primary_mac", "aa:bb:cc:dd:ee:01")
+
+	// duplicate_macs must be a JSON array of 2 MAC strings.
+	rawDups, ok := m["duplicate_macs"].([]any)
+	if !ok {
+		t.Fatalf("duplicate_macs type = %T, want []any (JSON array)", m["duplicate_macs"])
+	}
+	if len(rawDups) != 2 {
+		t.Fatalf("duplicate_macs len = %d, want 2", len(rawDups))
+	}
+	wantDups := []string{"ff:ee:dd:cc:bb:01", "11:22:33:44:55:66"}
+	for i, v := range rawDups {
+		s, _ := v.(string)
+		if s != wantDups[i] {
+			t.Errorf("duplicate_macs[%d] = %q, want %q", i, s, wantDups[i])
+		}
+	}
+}
+
 func TestMultipleEvents_OneLine_Each(t *testing.T) {
 	var buf bytes.Buffer
 	l := audit.NewLoggerForTest(&buf)

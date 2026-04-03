@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -653,6 +654,73 @@ func TestCollect_HostUp_HostnameLabel_Empty(t *testing.T) {
 	})
 	if s == nil {
 		t.Error("no host_up sample with empty hostname label for host with no hostnames")
+	}
+}
+
+func TestCollect_DuplicateIPDetected(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.14.0/24"
+
+	dupMAC, _ := net.ParseMAC("ff:ee:dd:cc:bb:aa")
+
+	// Host with a detected duplicate.
+	rogue := makeHost("10.0.14.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.DuplicateMACs = []net.HardwareAddr{dupMAC}
+	})
+	// Host without duplicate.
+	clean := makeHost("10.0.14.2", "aa:bb:cc:dd:ee:02")
+
+	for _, rec := range []state.HostRecord{rogue, clean} {
+		if _, err := store.UpdateHost(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_duplicate_ip_detected")
+	if fam == nil {
+		t.Fatal("signet_duplicate_ip_detected not emitted for host with DuplicateMACs")
+	}
+	// Only the one host with duplicates should produce a sample.
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("expected 1 sample (duplicate host only), got %d", len(fam.GetMetric()))
+	}
+
+	// The macs label must contain both the primary and duplicate MAC.
+	s := findSample(fam, map[string]string{
+		"ip":     "10.0.14.1",
+		"subnet": subnet,
+	})
+	if s == nil {
+		t.Fatal("no sample for the duplicate host ip/subnet")
+	}
+	if s.GetGauge().GetValue() != 1.0 {
+		t.Errorf("signet_duplicate_ip_detected value = %v, want 1", s.GetGauge().GetValue())
+	}
+	// Verify the macs label contains both MACs.
+	macsLabel := ""
+	for _, lp := range s.GetLabel() {
+		if lp.GetName() == "macs" {
+			macsLabel = lp.GetValue()
+		}
+	}
+	if macsLabel == "" {
+		t.Fatal("macs label is missing or empty")
+	}
+	if !strings.Contains(macsLabel, "aa:bb:cc:dd:ee:01") {
+		t.Errorf("macs label %q does not contain primary MAC", macsLabel)
+	}
+	if !strings.Contains(macsLabel, "ff:ee:dd:cc:bb:aa") {
+		t.Errorf("macs label %q does not contain duplicate MAC", macsLabel)
+	}
+
+	// Clean host must not appear in the metric.
+	cleanSample := findSample(fam, map[string]string{"ip": "10.0.14.2"})
+	if cleanSample != nil {
+		t.Error("host without duplicates should not appear in signet_duplicate_ip_detected")
 	}
 }
 

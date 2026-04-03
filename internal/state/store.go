@@ -11,10 +11,11 @@ import (
 // HostChange describes what changed during an UpdateHost call.
 // It is returned by value and computed inside the store's write lock.
 type HostChange struct {
-	IsNew      bool             // true if this IP was not previously in the store
-	MACChanged bool             // true if the MAC address changed (implies IsNew == false)
-	OldMAC     net.HardwareAddr // previous MAC (nil if IsNew or no change)
-	OldVendor  string           // previous vendor (empty if IsNew or no change)
+	IsNew             bool             // true if this IP was not previously in the store
+	MACChanged        bool             // true if the MAC address changed (implies IsNew == false)
+	OldMAC            net.HardwareAddr // previous MAC (nil if IsNew or no change)
+	OldVendor         string           // previous vendor (empty if IsNew or no change)
+	DuplicateDetected bool             // true if ARP found multiple MACs claiming this IP
 }
 
 // Store defines the interface for persisting and querying host inventory state.

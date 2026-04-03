@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/maravexa/signet-exporter/internal/state"
@@ -68,8 +69,8 @@ func NewSignetCollector(store state.Store, subnets []netip.Prefix, logger *slog.
 		),
 		duplicateIP: prometheus.NewDesc(
 			"signet_duplicate_ip_detected",
-			"1 if a duplicate IP address has been detected in the subnet, 0 otherwise.",
-			[]string{"ip", "subnet"}, nil,
+			"1 if multiple MACs claimed the same IP during the last ARP scan. Absent when no duplicate is detected.",
+			[]string{"ip", "macs", "subnet"}, nil,
 		),
 		dnsForwardReverseMismatch: prometheus.NewDesc(
 			"signet_dns_forward_reverse_mismatch",
@@ -237,7 +238,21 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 				)
 			}
 
-			// TODO: implement with duplicate detection logic — signet_duplicate_ip_detected
+			// signet_duplicate_ip_detected: only emitted when ARP saw multiple MACs for this IP.
+			// The macs label contains all claimants (primary first) as a comma-separated string.
+			if len(host.DuplicateMACs) > 0 {
+				allMACs := make([]string, 0, 1+len(host.DuplicateMACs))
+				allMACs = append(allMACs, macStr)
+				for _, dm := range host.DuplicateMACs {
+					allMACs = append(allMACs, dm.String())
+				}
+				ch <- prometheus.MustNewConstMetric(
+					c.duplicateIP,
+					prometheus.GaugeValue,
+					1,
+					ipStr, strings.Join(allMACs, ","), subnetStr,
+				)
+			}
 		}
 
 		// Scan timing metadata — emitted only when the scheduler has recorded data.
