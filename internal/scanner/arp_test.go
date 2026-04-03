@@ -263,3 +263,150 @@ func equalMAC(a, b net.HardwareAddr) bool {
 	}
 	return true
 }
+
+// --- groupARPReplies tests ---
+
+func TestGroupARPReplies_NoDuplicates(t *testing.T) {
+	mac1 := makeMAC("aa:bb:cc:dd:ee:01")
+	mac2 := makeMAC("aa:bb:cc:dd:ee:02")
+	ip1 := netip.MustParseAddr("10.0.0.1")
+	ip2 := netip.MustParseAddr("10.0.0.2")
+
+	replies := []arpReply{
+		{IP: ip1, MAC: mac1},
+		{IP: ip2, MAC: mac2},
+	}
+	results := groupARPReplies(replies)
+
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+	for _, r := range results {
+		if !r.DuplicateChecked {
+			t.Errorf("DuplicateChecked must be true for all ARP results; ip=%v", r.IP)
+		}
+		if len(r.DuplicateMACs) != 0 {
+			t.Errorf("DuplicateMACs should be empty for ip=%v, got %v", r.IP, r.DuplicateMACs)
+		}
+	}
+}
+
+func TestGroupARPReplies_DuplicateDetected(t *testing.T) {
+	mac1 := makeMAC("aa:bb:cc:dd:ee:01")
+	mac2 := makeMAC("ff:ee:dd:cc:bb:aa")
+	ip := netip.MustParseAddr("10.0.0.5")
+
+	replies := []arpReply{
+		{IP: ip, MAC: mac1},
+		{IP: ip, MAC: mac2},
+	}
+	results := groupARPReplies(replies)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result for a single IP, got %d", len(results))
+	}
+	r := results[0]
+	if !r.DuplicateChecked {
+		t.Error("DuplicateChecked must be true")
+	}
+	if !equalMAC(r.MAC, mac1) {
+		t.Errorf("primary MAC = %v, want %v (first respondent wins)", r.MAC, mac1)
+	}
+	if len(r.DuplicateMACs) != 1 {
+		t.Fatalf("DuplicateMACs len = %d, want 1", len(r.DuplicateMACs))
+	}
+	if !equalMAC(r.DuplicateMACs[0], mac2) {
+		t.Errorf("DuplicateMACs[0] = %v, want %v", r.DuplicateMACs[0], mac2)
+	}
+}
+
+func TestGroupARPReplies_SameMACMultipleReplies(t *testing.T) {
+	mac := makeMAC("aa:bb:cc:dd:ee:01")
+	ip := netip.MustParseAddr("10.0.0.7")
+
+	// Same MAC appears three times (retransmissions).
+	replies := []arpReply{
+		{IP: ip, MAC: mac},
+		{IP: ip, MAC: mac},
+		{IP: ip, MAC: mac},
+	}
+	results := groupARPReplies(replies)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	r := results[0]
+	if !r.DuplicateChecked {
+		t.Error("DuplicateChecked must be true")
+	}
+	if len(r.DuplicateMACs) != 0 {
+		t.Errorf("retransmissions must not be treated as duplicates; DuplicateMACs = %v", r.DuplicateMACs)
+	}
+}
+
+func TestGroupARPReplies_ThreeMACs_SameIP(t *testing.T) {
+	mac1 := makeMAC("aa:bb:cc:dd:ee:01")
+	mac2 := makeMAC("aa:bb:cc:dd:ee:02")
+	mac3 := makeMAC("aa:bb:cc:dd:ee:03")
+	ip := netip.MustParseAddr("10.0.0.9")
+
+	replies := []arpReply{
+		{IP: ip, MAC: mac1},
+		{IP: ip, MAC: mac2},
+		{IP: ip, MAC: mac3},
+	}
+	results := groupARPReplies(replies)
+
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	r := results[0]
+	if !equalMAC(r.MAC, mac1) {
+		t.Errorf("primary MAC = %v, want %v", r.MAC, mac1)
+	}
+	if len(r.DuplicateMACs) != 2 {
+		t.Fatalf("DuplicateMACs len = %d, want 2", len(r.DuplicateMACs))
+	}
+	// Both mac2 and mac3 must appear in DuplicateMACs (order not guaranteed).
+	found := map[string]bool{}
+	for _, dm := range r.DuplicateMACs {
+		found[dm.String()] = true
+	}
+	if !found[mac2.String()] {
+		t.Errorf("mac2 (%v) not in DuplicateMACs", mac2)
+	}
+	if !found[mac3.String()] {
+		t.Errorf("mac3 (%v) not in DuplicateMACs", mac3)
+	}
+}
+
+func TestGroupARPReplies_DeepCopy(t *testing.T) {
+	mac := makeMAC("aa:bb:cc:dd:ee:01")
+	dupMAC := makeMAC("ff:ee:dd:cc:bb:aa")
+	ip := netip.MustParseAddr("10.0.0.1")
+
+	replies := []arpReply{
+		{IP: ip, MAC: mac},
+		{IP: ip, MAC: dupMAC},
+	}
+	results := groupARPReplies(replies)
+
+	// Mutate the original slices.
+	mac[0] = 0x00
+	dupMAC[0] = 0x00
+
+	r := results[0]
+	if r.MAC[0] == 0x00 {
+		t.Error("primary MAC was aliased to the input slice")
+	}
+	if r.DuplicateMACs[0][0] == 0x00 {
+		t.Error("DuplicateMACs[0] was aliased to the input slice")
+	}
+}
+
+func TestGroupARPReplies_Empty(t *testing.T) {
+	results := groupARPReplies(nil)
+	if len(results) != 0 {
+		t.Errorf("expected 0 results for nil input, got %d", len(results))
+	}
+}

@@ -117,16 +117,76 @@ sendLoop:
 	_ = conn.Close()
 	wg.Wait()
 
-	// Deduplicate by IP — some hosts send multiple replies (gratuitous ARP, etc.).
-	seen := make(map[netip.Addr]bool)
-	var out []ScanResult
+	// Collect all replies, then group by IP to detect duplicate claimants.
+	var allReplies []arpReply
 	for r := range results {
-		if !seen[r.IP] {
-			seen[r.IP] = true
-			out = append(out, r)
+		allReplies = append(allReplies, arpReply{
+			IP:        r.IP,
+			MAC:       r.MAC,
+			Timestamp: r.Timestamp,
+		})
+	}
+	return groupARPReplies(allReplies), nil
+}
+
+// arpReply holds a single parsed ARP reply for intermediate grouping.
+type arpReply struct {
+	IP        netip.Addr
+	MAC       net.HardwareAddr
+	Timestamp time.Time
+}
+
+// groupARPReplies groups raw ARP replies by IP, detecting when multiple distinct
+// MACs claim the same IP within a single scan window.
+//
+// The first respondent per IP becomes the primary ScanResult (existing behavior).
+// Additional distinct MACs are stored in DuplicateMACs. Retransmissions from the
+// same MAC are silently ignored. DuplicateChecked is always true on ARP results.
+func groupARPReplies(replies []arpReply) []ScanResult {
+	type ipGroup struct {
+		first    arpReply
+		dupMACs  []net.HardwareAddr
+		seenMACs map[string]bool
+	}
+
+	groups := make(map[netip.Addr]*ipGroup)
+	order := make([]netip.Addr, 0, len(replies))
+
+	for _, r := range replies {
+		g, ok := groups[r.IP]
+		if !ok {
+			mac := make(net.HardwareAddr, len(r.MAC))
+			copy(mac, r.MAC)
+			groups[r.IP] = &ipGroup{
+				first:    arpReply{IP: r.IP, MAC: mac, Timestamp: r.Timestamp},
+				seenMACs: map[string]bool{r.MAC.String(): true},
+			}
+			order = append(order, r.IP)
+			continue
+		}
+		macStr := r.MAC.String()
+		if !g.seenMACs[macStr] {
+			g.seenMACs[macStr] = true
+			dupMAC := make(net.HardwareAddr, len(r.MAC))
+			copy(dupMAC, r.MAC)
+			g.dupMACs = append(g.dupMACs, dupMAC)
 		}
 	}
-	return out, nil
+
+	out := make([]ScanResult, 0, len(groups))
+	for _, ip := range order {
+		g := groups[ip]
+		out = append(out, ScanResult{
+			IP:               g.first.IP,
+			MAC:              g.first.MAC,
+			Alive:            true,
+			Source:           "arp",
+			Timestamp:        g.first.Timestamp,
+			DuplicateChecked: true,
+			DuplicateMACs:    g.dupMACs,
+		})
+	}
+	return out
 }
 
 // listenForReplies reads ARP reply frames from conn until it is closed or ctx

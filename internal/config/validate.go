@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
 )
 
 // Validate checks the configuration for logical errors and missing required fields.
@@ -38,6 +40,22 @@ func Validate(cfg *Config) error {
 		return fmt.Errorf("state.bolt_path: required when backend is \"bolt\"")
 	}
 
+	if err := validateAudit(&cfg.Audit); err != nil {
+		return fmt.Errorf("audit: %w", err)
+	}
+
+	return nil
+}
+
+func validateAudit(a *AuditConfig) error {
+	if !a.Enabled || a.Output == "" || a.Output == "stderr" {
+		return nil
+	}
+	// File output: verify the parent directory exists.
+	dir := filepath.Dir(a.Output)
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return fmt.Errorf("output: parent directory %q does not exist", dir)
+	}
 	return nil
 }
 
@@ -79,6 +97,11 @@ func validateSubnet(s *SubnetConfig) error {
 	}
 	if s.ScanInterval <= 0 {
 		return fmt.Errorf("scan_interval must be > 0")
+	}
+	if s.MACAllowlistFile != "" {
+		if _, err := os.Stat(s.MACAllowlistFile); os.IsNotExist(err) {
+			return fmt.Errorf("mac_allowlist_file %q does not exist", s.MACAllowlistFile)
+		}
 	}
 	return nil
 }

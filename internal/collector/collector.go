@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/netip"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/maravexa/signet-exporter/internal/state"
@@ -54,7 +55,7 @@ func NewSignetCollector(store state.Store, subnets []netip.Prefix, logger *slog.
 		hostUp: prometheus.NewDesc(
 			"signet_host_up",
 			"1 if the host responded during the most recent scan, 0 otherwise.",
-			[]string{"ip", "mac", "vendor", "subnet"}, nil,
+			[]string{"ip", "mac", "vendor", "hostname", "subnet"}, nil,
 		),
 		scanDuration: prometheus.NewDesc(
 			"signet_scan_duration_seconds",
@@ -68,8 +69,8 @@ func NewSignetCollector(store state.Store, subnets []netip.Prefix, logger *slog.
 		),
 		duplicateIP: prometheus.NewDesc(
 			"signet_duplicate_ip_detected",
-			"1 if a duplicate IP address has been detected in the subnet, 0 otherwise.",
-			[]string{"ip", "subnet"}, nil,
+			"1 if multiple MACs claimed the same IP during the last ARP scan. Absent when no duplicate is detected.",
+			[]string{"ip", "macs", "subnet"}, nil,
 		),
 		dnsForwardReverseMismatch: prometheus.NewDesc(
 			"signet_dns_forward_reverse_mismatch",
@@ -185,24 +186,27 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 			if now.Sub(host.LastSeen) > stalenessThreshold {
 				upVal = 0.0
 			}
+			hostname := ""
+			if len(host.Hostnames) > 0 {
+				hostname = host.Hostnames[0]
+			}
 			ch <- prometheus.MustNewConstMetric(
 				c.hostUp,
 				prometheus.GaugeValue,
 				upVal,
-				ipStr, macStr, vendor, subnetStr,
+				ipStr, macStr, vendor, hostname, subnetStr,
 			)
 
-			// signet_unauthorized_device_detected.
-			authorizedVal := 0.0
-			if !host.Authorized {
-				authorizedVal = 1.0
+			// signet_unauthorized_device_detected: only emitted for hosts whose
+			// allowlist check has been applied and whose MAC is not authorized.
+			if host.AuthorizationChecked && !host.Authorized {
+				ch <- prometheus.MustNewConstMetric(
+					c.unauthorizedDevice,
+					prometheus.GaugeValue,
+					1,
+					ipStr, macStr, vendor, subnetStr,
+				)
 			}
-			ch <- prometheus.MustNewConstMetric(
-				c.unauthorizedDevice,
-				prometheus.GaugeValue,
-				authorizedVal,
-				ipStr, macStr, vendor, subnetStr,
-			)
 
 			// signet_port_open: one metric per open port.
 			for _, port := range host.OpenPorts {
@@ -234,7 +238,21 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 				)
 			}
 
-			// TODO: implement with duplicate detection logic — signet_duplicate_ip_detected
+			// signet_duplicate_ip_detected: only emitted when ARP saw multiple MACs for this IP.
+			// The macs label contains all claimants (primary first) as a comma-separated string.
+			if len(host.DuplicateMACs) > 0 {
+				allMACs := make([]string, 0, 1+len(host.DuplicateMACs))
+				allMACs = append(allMACs, macStr)
+				for _, dm := range host.DuplicateMACs {
+					allMACs = append(allMACs, dm.String())
+				}
+				ch <- prometheus.MustNewConstMetric(
+					c.duplicateIP,
+					prometheus.GaugeValue,
+					1,
+					ipStr, strings.Join(allMACs, ","), subnetStr,
+				)
+			}
 		}
 
 		// Scan timing metadata — emitted only when the scheduler has recorded data.

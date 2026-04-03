@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,7 +128,7 @@ func TestCollect_HostUp(t *testing.T) {
 	}
 	for _, h := range hosts {
 		rec := makeHost(h.ip, h.mac, func(r *state.HostRecord) { r.Vendor = h.vendor })
-		if err := store.UpdateHost(ctx, rec); err != nil {
+		if _, err := store.UpdateHost(ctx, rec); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -167,7 +168,7 @@ func TestCollect_HostUp_Stale(t *testing.T) {
 	rec := makeHost("10.0.1.10", "aa:bb:cc:dd:ee:10", func(r *state.HostRecord) {
 		r.LastSeen = time.Now().Add(-10 * time.Minute) // older than 5m staleness threshold
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -194,7 +195,7 @@ func TestCollect_SubnetUtilization(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		ip := netip.AddrFrom4([4]byte{10, 0, 2, byte(i)}).String()
 		mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, byte(i)}.String()
-		if err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
+		if _, err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -238,7 +239,7 @@ func TestCollect_MultipleSubnets(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		ip := netip.AddrFrom4([4]byte{10, 1, 0, byte(i)}).String()
 		mac := net.HardwareAddr{0xaa, 0x01, 0x00, 0x00, 0x00, byte(i)}.String()
-		if err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
+		if _, err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -246,7 +247,7 @@ func TestCollect_MultipleSubnets(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		ip := netip.AddrFrom4([4]byte{10, 2, 0, byte(i)}).String()
 		mac := net.HardwareAddr{0xaa, 0x02, 0x00, 0x00, 0x00, byte(i)}.String()
-		if err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
+		if _, err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -295,17 +296,23 @@ func TestCollect_UnauthorizedDevice(t *testing.T) {
 	store := state.NewMemoryStore()
 	subnet := "10.0.3.0/24"
 
-	unauthorized := makeHost("10.0.3.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+	// Checked + unauthorized: must emit metric with value 1.
+	rogue := makeHost("10.0.3.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.Authorized = false
+		r.AuthorizationChecked = true
 	})
-	authorized := makeHost("10.0.3.2", "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
+	// Checked + authorized: must NOT emit metric.
+	legit := makeHost("10.0.3.2", "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
 		r.Authorized = true
+		r.AuthorizationChecked = true
 	})
-	if err := store.UpdateHost(ctx, unauthorized); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.UpdateHost(ctx, authorized); err != nil {
-		t.Fatal(err)
+	// Unchecked (no allowlist configured): must NOT emit metric.
+	unchecked := makeHost("10.0.3.3", "aa:bb:cc:dd:ee:03")
+
+	for _, rec := range []state.HostRecord{rogue, legit, unchecked} {
+		if _, err := store.UpdateHost(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	c := newTestCollector(store, subnet)
@@ -313,7 +320,10 @@ func TestCollect_UnauthorizedDevice(t *testing.T) {
 
 	fam := findMetric(families, "signet_unauthorized_device_detected")
 	if fam == nil {
-		t.Fatal("signet_unauthorized_device_detected not emitted")
+		t.Fatal("signet_unauthorized_device_detected not emitted at all")
+	}
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("expected exactly 1 sample (rogue only), got %d", len(fam.GetMetric()))
 	}
 
 	unauthSample := findSample(fam, map[string]string{
@@ -323,23 +333,22 @@ func TestCollect_UnauthorizedDevice(t *testing.T) {
 		"subnet": subnet,
 	})
 	if unauthSample == nil {
-		t.Fatal("no sample for unauthorized host")
+		t.Fatal("no sample for rogue host")
 	}
 	if unauthSample.GetGauge().GetValue() != 1.0 {
-		t.Errorf("unauthorized host value = %v, want 1", unauthSample.GetGauge().GetValue())
+		t.Errorf("rogue host value = %v, want 1", unauthSample.GetGauge().GetValue())
 	}
 
-	authSample := findSample(fam, map[string]string{
-		"ip":     "10.0.3.2",
-		"mac":    "aa:bb:cc:dd:ee:02",
-		"vendor": "TestVendor",
-		"subnet": subnet,
-	})
-	if authSample == nil {
-		t.Fatal("no sample for authorized host")
+	// Authorized+checked host must not appear.
+	legitSample := findSample(fam, map[string]string{"ip": "10.0.3.2"})
+	if legitSample != nil {
+		t.Error("authorized host should not appear in signet_unauthorized_device_detected")
 	}
-	if authSample.GetGauge().GetValue() != 0.0 {
-		t.Errorf("authorized host value = %v, want 0", authSample.GetGauge().GetValue())
+
+	// Unchecked host must not appear.
+	uncheckedSample := findSample(fam, map[string]string{"ip": "10.0.3.3"})
+	if uncheckedSample != nil {
+		t.Error("unchecked host should not appear in signet_unauthorized_device_detected")
 	}
 }
 
@@ -351,7 +360,7 @@ func TestCollect_PortOpen(t *testing.T) {
 	rec := makeHost("10.0.4.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.OpenPorts = []uint16{22, 443}
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -388,12 +397,12 @@ func TestCollect_MACBindingChanges(t *testing.T) {
 	ip := "10.0.5.1"
 
 	// Insert initial record
-	if err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:01")); err != nil {
+	if _, err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:01")); err != nil {
 		t.Fatal(err)
 	}
 
 	// First MAC change
-	if err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
+	if _, err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
 		r.LastSeen = time.Now().Add(time.Second)
 	})); err != nil {
 		t.Fatal(err)
@@ -415,7 +424,7 @@ func TestCollect_MACBindingChanges(t *testing.T) {
 	}
 
 	// Second MAC change
-	if err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:03", func(r *state.HostRecord) {
+	if _, err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:03", func(r *state.HostRecord) {
 		r.LastSeen = time.Now().Add(2 * time.Second)
 	})); err != nil {
 		t.Fatal(err)
@@ -539,7 +548,7 @@ func TestCollect_DNSMismatch(t *testing.T) {
 	rec := makeHost("10.0.8.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.DNSMismatches = []string{"bad.example.com"}
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -572,7 +581,7 @@ func TestCollect_DNSNoMismatch(t *testing.T) {
 	rec := makeHost("10.0.9.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.DNSMismatches = []string{}
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -586,6 +595,132 @@ func TestCollect_DNSNoMismatch(t *testing.T) {
 	s := findSample(fam, map[string]string{"ip": "10.0.9.1", "subnet": subnet})
 	if s != nil {
 		t.Error("signet_dns_forward_reverse_mismatch emitted for host with no mismatches, want no sample")
+	}
+}
+
+func TestCollect_HostUp_HostnameLabel_Populated(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.12.0/24"
+
+	rec := makeHost("10.0.12.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.Hostnames = []string{"host1.example.com", "alias.example.com"}
+	})
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_host_up")
+	if fam == nil {
+		t.Fatal("signet_host_up not emitted")
+	}
+	s := findSample(fam, map[string]string{
+		"ip":       "10.0.12.1",
+		"hostname": "host1.example.com",
+		"subnet":   subnet,
+	})
+	if s == nil {
+		t.Error("no host_up sample with first hostname label")
+	}
+}
+
+func TestCollect_HostUp_HostnameLabel_Empty(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.13.0/24"
+
+	// Host with no hostnames: label should be empty string.
+	rec := makeHost("10.0.13.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.Hostnames = nil
+	})
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_host_up")
+	if fam == nil {
+		t.Fatal("signet_host_up not emitted")
+	}
+	s := findSample(fam, map[string]string{
+		"ip":       "10.0.13.1",
+		"hostname": "",
+		"subnet":   subnet,
+	})
+	if s == nil {
+		t.Error("no host_up sample with empty hostname label for host with no hostnames")
+	}
+}
+
+func TestCollect_DuplicateIPDetected(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.14.0/24"
+
+	dupMAC, _ := net.ParseMAC("ff:ee:dd:cc:bb:aa")
+
+	// Host with a detected duplicate.
+	rogue := makeHost("10.0.14.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.DuplicateMACs = []net.HardwareAddr{dupMAC}
+	})
+	// Host without duplicate.
+	clean := makeHost("10.0.14.2", "aa:bb:cc:dd:ee:02")
+
+	for _, rec := range []state.HostRecord{rogue, clean} {
+		if _, err := store.UpdateHost(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_duplicate_ip_detected")
+	if fam == nil {
+		t.Fatal("signet_duplicate_ip_detected not emitted for host with DuplicateMACs")
+	}
+	// Only the one host with duplicates should produce a sample.
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("expected 1 sample (duplicate host only), got %d", len(fam.GetMetric()))
+	}
+
+	// The macs label must contain both the primary and duplicate MAC.
+	s := findSample(fam, map[string]string{
+		"ip":     "10.0.14.1",
+		"subnet": subnet,
+	})
+	if s == nil {
+		t.Fatal("no sample for the duplicate host ip/subnet")
+	}
+	if s.GetGauge().GetValue() != 1.0 {
+		t.Errorf("signet_duplicate_ip_detected value = %v, want 1", s.GetGauge().GetValue())
+	}
+	// Verify the macs label contains both MACs.
+	macsLabel := ""
+	for _, lp := range s.GetLabel() {
+		if lp.GetName() == "macs" {
+			macsLabel = lp.GetValue()
+		}
+	}
+	if macsLabel == "" {
+		t.Fatal("macs label is missing or empty")
+	}
+	if !strings.Contains(macsLabel, "aa:bb:cc:dd:ee:01") {
+		t.Errorf("macs label %q does not contain primary MAC", macsLabel)
+	}
+	if !strings.Contains(macsLabel, "ff:ee:dd:cc:bb:aa") {
+		t.Errorf("macs label %q does not contain duplicate MAC", macsLabel)
+	}
+
+	// Clean host must not appear in the metric.
+	cleanSample := findSample(fam, map[string]string{"ip": "10.0.14.2"})
+	if cleanSample != nil {
+		t.Error("host without duplicates should not appear in signet_duplicate_ip_detected")
 	}
 }
 

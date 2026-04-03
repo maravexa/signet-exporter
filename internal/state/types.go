@@ -8,17 +8,20 @@ import (
 
 // HostRecord represents the observed state of a single host on the network.
 type HostRecord struct {
-	IP             netip.Addr
-	MAC            net.HardwareAddr
-	Vendor         string
-	Hostnames      []string
-	DNSMismatches  []string // hostnames where reverse→forward lookup doesn't resolve back to this IP
-	FirstSeen      time.Time
-	LastSeen       time.Time
-	OpenPorts      []uint16
-	Alive          bool   // true if the host responded during the last scan
-	Authorized     bool   // true if MAC is in the configured allowlist
-	MACChangeCount uint64 // cumulative count of MAC address changes for this IP
+	IP                   netip.Addr
+	MAC                  net.HardwareAddr
+	Vendor               string
+	Hostnames            []string
+	DNSMismatches        []string // hostnames where reverse→forward lookup doesn't resolve back to this IP
+	FirstSeen            time.Time
+	LastSeen             time.Time
+	OpenPorts            []uint16
+	DuplicateMACs        []net.HardwareAddr // other MACs that claimed this IP in the last ARP scan; nil means none
+	Alive                bool               // true if the host responded during the last scan
+	Authorized           bool               // true if MAC is in the configured allowlist
+	AuthorizationChecked bool               // true if allowlist enforcement was applied this cycle
+	DuplicateChecked     bool               // true if the ARP scanner authoratively set DuplicateMACs this cycle
+	MACChangeCount       uint64             // cumulative count of MAC address changes for this IP
 }
 
 // MACIPChange records when a MAC address changes for a given IP.

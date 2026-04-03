@@ -1,8 +1,110 @@
-# IEEE OUI database placeholder
-#
-# This file should be replaced with the current IEEE OUI database snapshot.
-# Download from: https://standards-oui.ieee.org/oui/oui.txt
-#
-# Example entry format (tab-separated):
-#   00-00-0C   (hex)   Cisco Systems, Inc
-#   00000C     (base 16)   Cisco Systems, Inc
+OUI/MA-L			Organization
+company_id			Organization
+				Address
+
+# TODO: Replace this stub with the full IEEE OUI database snapshot.
+# Download from: https://standards-oui.ieee.org/oui/oui.txt (~6 MB, ~30,000 entries)
+# This stub contains enough entries to pass tests and demonstrate the lookup feature.
+
+DC-A6-32   (hex)		Raspberry Pi Trading Ltd
+DCA632     (base 16)		Raspberry Pi Trading Ltd
+				Maurice Wilkes Building, Cowley Road
+				Cambridge    CB4 0DS
+				GB
+
+00-50-56   (hex)		VMware, Inc.
+005056     (base 16)		VMware, Inc.
+				3401 Hillview Ave
+				Palo Alto  CA  94304
+				US
+
+AC-DE-48   (hex)		Private
+ACDE48     (base 16)		Private
+
+00-1A-11   (hex)		Google, Inc.
+001A11     (base 16)		Google, Inc.
+				1600 Amphitheatre Parkway
+				Mountain View  CA  94043
+				US
+
+00-0C-29   (hex)		VMware, Inc.
+000C29     (base 16)		VMware, Inc.
+				3401 Hillview Ave
+				Palo Alto  CA  94304
+				US
+
+B8-27-EB   (hex)		Raspberry Pi Foundation
+B827EB     (base 16)		Raspberry Pi Foundation
+				Mitchell Wood House, Caldecote
+				Cambridge    CB23 7EY
+				GB
+
+00-1C-42   (hex)		Parallels, Inc.
+001C42     (base 16)		Parallels, Inc.
+				15220 NE 40th Street
+				Redmond  WA  98052
+				US
+
+52-54-00   (hex)		QEMU Virtual NIC
+525400     (base 16)		QEMU Virtual NIC
+
+00-15-5D   (hex)		Microsoft Corporation
+00155D     (base 16)		Microsoft Corporation
+				One Microsoft Way
+				Redmond  WA  98052
+				US
+
+00-50-C2   (hex)		IEEE Registration Authority
+0050C2     (base 16)		IEEE Registration Authority
+				445 Hoes Lane
+				Piscataway  NJ  08554
+				US
+
+00-00-0C   (hex)		Cisco Systems, Inc
+00000C     (base 16)		Cisco Systems, Inc
+				170 West Tasman Drive
+				San Jose  CA  95134
+				US
+
+00-1B-21   (hex)		Intel Corporate
+001B21     (base 16)		Intel Corporate
+				Lot 8, Jalan Hi-Tech 2/3
+				Kulim  Kedah  09000
+				MY
+
+E4-CE-8F   (hex)		Apple, Inc.
+E4CE8F     (base 16)		Apple, Inc.
+				1 Infinite Loop
+				Cupertino  CA  95014
+				US
+
+3C-22-FB   (hex)		Apple, Inc.
+3C22FB     (base 16)		Apple, Inc.
+				1 Infinite Loop
+				Cupertino  CA  95014
+				US
+
+F0-18-98   (hex)		Apple, Inc.
+F01898     (base 16)		Apple, Inc.
+				1 Infinite Loop
+				Cupertino  CA  95014
+				US
+
+00-26-BB   (hex)		Apple, Inc.
+0026BB     (base 16)		Apple, Inc.
+				1 Infinite Loop
+				Cupertino  CA  95014
+				US
+
+74-DA-38   (hex)		New H3C Technologies Co., Ltd
+74DA38     (base 16)		New H3C Technologies Co., Ltd
+				310 Liuhe Road, Zhijiang Science Park
+				Hangzhou  Zhejiang  310053
+				CN
+
+1C-6F-65   (hex)		Cisco Systems, Inc
+1C6F65     (base 16)		Cisco Systems, Inc
+				170 West Tasman Drive
+				San Jose  CA  95134
+				US
+

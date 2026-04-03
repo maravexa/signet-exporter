@@ -68,6 +68,15 @@ func copyHostRecord(r *HostRecord) HostRecord {
 		copy(out.OpenPorts, r.OpenPorts)
 	}
 
+	if r.DuplicateMACs != nil {
+		out.DuplicateMACs = make([]net.HardwareAddr, len(r.DuplicateMACs))
+		for i, mac := range r.DuplicateMACs {
+			dupMAC := make(net.HardwareAddr, len(mac))
+			copy(dupMAC, mac)
+			out.DuplicateMACs[i] = dupMAC
+		}
+	}
+
 	return out
 }
 
@@ -85,10 +94,10 @@ func copyMACIPChange(c MACIPChange) MACIPChange {
 	return out
 }
 
-// UpdateHost inserts or updates a host record.
+// UpdateHost inserts or updates a host record and reports what changed.
 // If record.MAC is nil or empty (e.g. from an ICMP scan that has no L2 info),
 // the method updates liveness fields but preserves any existing MAC binding.
-func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
+func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) (HostChange, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -105,7 +114,10 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 			macKey := record.MAC.String()
 			m.macIndex[macKey] = append(m.macIndex[macKey], record.IP)
 		}
-		return nil
+		return HostChange{
+			IsNew:             true,
+			DuplicateDetected: record.DuplicateChecked && len(record.DuplicateMACs) > 0,
+		}, nil
 	}
 
 	if len(record.MAC) == 0 {
@@ -125,7 +137,7 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 			existing.OpenPorts = make([]uint16, len(record.OpenPorts))
 			copy(existing.OpenPorts, record.OpenPorts)
 		}
-		return nil
+		return HostChange{}, nil
 	}
 
 	if bytes.Equal(existing.MAC, record.MAC) {
@@ -147,21 +159,35 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 			copy(existing.OpenPorts, record.OpenPorts)
 		}
 		existing.Vendor = record.Vendor
-		existing.Authorized = record.Authorized
+		if record.AuthorizationChecked {
+			existing.AuthorizationChecked = true
+			existing.Authorized = record.Authorized
+		}
+		if record.DuplicateChecked {
+			existing.DuplicateChecked = true
+			existing.DuplicateMACs = copyDuplicateMACs(record.DuplicateMACs)
+		}
 		existing.Alive = record.Alive
-		return nil
+		return HostChange{DuplicateDetected: record.DuplicateChecked && len(record.DuplicateMACs) > 0}, nil
 	}
 
-	// Different MAC — binding change
-	change := MACIPChange{
+	// Different MAC — binding change. Capture previous state before overwriting.
+	hostChange := HostChange{
+		MACChanged: true,
+		OldMAC:     make(net.HardwareAddr, len(existing.MAC)),
+		OldVendor:  existing.Vendor,
+	}
+	copy(hostChange.OldMAC, existing.MAC)
+
+	macIPChange := MACIPChange{
 		IP:        record.IP,
 		OldMAC:    make(net.HardwareAddr, len(existing.MAC)),
 		NewMAC:    make(net.HardwareAddr, len(record.MAC)),
 		Timestamp: record.LastSeen,
 	}
-	copy(change.OldMAC, existing.MAC)
-	copy(change.NewMAC, record.MAC)
-	m.appendChange(change)
+	copy(macIPChange.OldMAC, existing.MAC)
+	copy(macIPChange.NewMAC, record.MAC)
+	m.appendChange(macIPChange)
 
 	// Update macIndex: remove IP from old MAC, add to new MAC
 	oldKey := existing.MAC.String()
@@ -186,11 +212,34 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) error {
 		copy(existing.OpenPorts, record.OpenPorts)
 	}
 	existing.Vendor = record.Vendor
-	existing.Authorized = record.Authorized
+	if record.AuthorizationChecked {
+		existing.AuthorizationChecked = true
+		existing.Authorized = record.Authorized
+	}
+	if record.DuplicateChecked {
+		existing.DuplicateChecked = true
+		existing.DuplicateMACs = copyDuplicateMACs(record.DuplicateMACs)
+	}
 	existing.Alive = record.Alive
 	existing.MACChangeCount++
+	hostChange.DuplicateDetected = record.DuplicateChecked && len(record.DuplicateMACs) > 0
 
-	return nil
+	return hostChange, nil
+}
+
+// copyDuplicateMACs returns a deep copy of a []net.HardwareAddr slice.
+// Returns nil when the input is nil (preserves nil semantics).
+func copyDuplicateMACs(macs []net.HardwareAddr) []net.HardwareAddr {
+	if macs == nil {
+		return nil
+	}
+	out := make([]net.HardwareAddr, len(macs))
+	for i, mac := range macs {
+		dupMAC := make(net.HardwareAddr, len(mac))
+		copy(dupMAC, mac)
+		out[i] = dupMAC
+	}
+	return out
 }
 
 // appendChange appends to the ring buffer under an already-held write lock.

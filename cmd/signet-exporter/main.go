@@ -13,8 +13,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/maravexa/signet-exporter/internal/audit"
 	"github.com/maravexa/signet-exporter/internal/collector"
 	"github.com/maravexa/signet-exporter/internal/config"
+	"github.com/maravexa/signet-exporter/internal/oui"
 	"github.com/maravexa/signet-exporter/internal/scanner"
 	"github.com/maravexa/signet-exporter/internal/server"
 	"github.com/maravexa/signet-exporter/internal/state"
@@ -105,6 +107,25 @@ func main() {
 		}
 	}
 
+	// Load per-subnet MAC allowlists. Failure is fatal — a misconfigured allowlist
+	// could silently disable rogue device detection.
+	allowlists := make(map[string]*scanner.Allowlist)
+	for _, s := range cfg.Subnets {
+		if s.MACAllowlistFile == "" {
+			continue
+		}
+		prefix, _ := netip.ParsePrefix(s.CIDR) // already validated above
+		al, alErr := scanner.LoadAllowlist(s.MACAllowlistFile)
+		if alErr != nil {
+			logger.Error("failed to load MAC allowlist", "subnet", s.CIDR, "path", s.MACAllowlistFile, "err", alErr)
+			os.Exit(1)
+		}
+		if al != nil {
+			logger.Info("MAC allowlist loaded", "subnet", s.CIDR, "path", s.MACAllowlistFile, "entries", al.Len())
+			allowlists[prefix.String()] = al
+		}
+	}
+
 	// Build scanner list. ARP and ICMP discover hosts; DNS enriches hostnames;
 	// port scanner probes open TCP ports — all run sequentially per scan cycle.
 	scanners := []scanner.Scanner{
@@ -114,8 +135,35 @@ func main() {
 		scanner.NewPortScanner(store, subnetPorts, nil, cfg.Scanner.PortTimeout, cfg.Scanner.PortMaxWorkers, logger),
 	}
 
+	// Load OUI vendor database if configured; failure is non-fatal (degraded mode).
+	var ouiDB *oui.Database
+	if cfg.OUIDatabase != "" {
+		var ouiErr error
+		ouiDB, ouiErr = oui.LoadDatabase(cfg.OUIDatabase)
+		if ouiErr != nil {
+			logger.Warn("OUI database unavailable — vendor labels will be empty",
+				"path", cfg.OUIDatabase,
+				"err", ouiErr,
+			)
+			ouiDB = nil
+		} else {
+			logger.Info("OUI database loaded", "path", cfg.OUIDatabase, "entries", ouiDB.Len())
+		}
+	}
+
+	// Create structured audit logger. Failure is fatal — don't run without audit if configured.
+	auditLogger, err := audit.NewLogger(audit.Config{
+		Enabled: cfg.Audit.Enabled,
+		Output:  cfg.Audit.Output,
+	})
+	if err != nil {
+		logger.Error("failed to create audit logger", "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = auditLogger.Close() }()
+
 	signetCollector := collector.NewSignetCollector(store, prefixes, logger)
-	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger)
+	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger, ouiDB, auditLogger, allowlists)
 
 	if cfg.TLS.CertFile == "" {
 		logger.Warn("TLS not configured — serving metrics over plaintext HTTP; not recommended for production")

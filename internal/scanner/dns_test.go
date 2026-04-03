@@ -92,7 +92,7 @@ func insertHost(t *testing.T, store state.Store, ip, mac string) {
 		LastSeen: time.Now(),
 		Alive:    true,
 	}
-	if err := store.UpdateHost(context.Background(), rec); err != nil {
+	if _, err := store.UpdateHost(context.Background(), rec); err != nil {
 		t.Fatalf("UpdateHost: %v", err)
 	}
 }

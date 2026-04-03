@@ -3,10 +3,13 @@ package scanner
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/netip"
 	"sync"
 	"time"
 
+	"github.com/maravexa/signet-exporter/internal/audit"
+	"github.com/maravexa/signet-exporter/internal/oui"
 	"github.com/maravexa/signet-exporter/internal/state"
 )
 
@@ -18,24 +21,33 @@ type SubnetConfig struct {
 
 // Scheduler drives periodic subnet scans with a configurable concurrency limit.
 type Scheduler struct {
-	scanners  []Scanner
-	store     state.Store
-	subnets   []SubnetConfig
-	semaphore chan struct{} // limits the number of concurrent subnet scans in flight
-	logger    *slog.Logger
-	readyCh   chan struct{} // closed after every configured subnet completes its first scan
-	readyOnce sync.Once
+	scanners   []Scanner
+	store      state.Store
+	ouiDB      *oui.Database         // may be nil when no OUI file is configured
+	auditLog   *audit.Logger         // never nil after construction; disabled logger used as no-op
+	allowlists map[string]*Allowlist // key: subnet prefix string; nil map = no allowlists configured
+	subnets    []SubnetConfig
+	semaphore  chan struct{} // limits the number of concurrent subnet scans in flight
+	logger     *slog.Logger
+	readyCh    chan struct{} // closed after every configured subnet completes its first scan
+	readyOnce  sync.Once
 }
 
 // NewScheduler creates a Scheduler.
 // maxParallel controls how many subnet scans may run concurrently; if <= 0, defaults to 1.
 // If scanners is empty, no scanning occurs but the scheduler is otherwise valid.
+// ouiDB may be nil; when nil, vendor enrichment is skipped silently.
+// auditLog may be nil; when nil, a no-op disabled logger is used.
+// allowlists may be nil; when nil, no authorization checks are performed.
 func NewScheduler(
 	scanners []Scanner,
 	store state.Store,
 	subnets []SubnetConfig,
 	maxParallel int,
 	logger *slog.Logger,
+	ouiDB *oui.Database,
+	auditLog *audit.Logger,
+	allowlists map[string]*Allowlist,
 ) *Scheduler {
 	if maxParallel <= 0 {
 		maxParallel = 1
@@ -43,16 +55,22 @@ func NewScheduler(
 	if logger == nil {
 		logger = slog.Default()
 	}
+	if auditLog == nil {
+		auditLog = audit.Disabled()
+	}
 	if len(scanners) == 0 {
 		logger.Warn("scheduler: no scanners registered — no hosts will be discovered")
 	}
 	return &Scheduler{
-		scanners:  scanners,
-		store:     store,
-		subnets:   subnets,
-		semaphore: make(chan struct{}, maxParallel),
-		logger:    logger,
-		readyCh:   make(chan struct{}),
+		scanners:   scanners,
+		store:      store,
+		ouiDB:      ouiDB,
+		auditLog:   auditLog,
+		allowlists: allowlists,
+		subnets:    subnets,
+		semaphore:  make(chan struct{}, maxParallel),
+		logger:     logger,
+		readyCh:    make(chan struct{}),
 	}
 }
 
@@ -134,6 +152,11 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 		return
 	}
 
+	subnetStr := sc.Prefix.String()
+	cycleStart := time.Now()
+	var totalHosts int
+	scannersRun := make([]string, 0, len(s.scanners))
+
 	for _, scanner := range s.scanners {
 		if ctx.Err() != nil {
 			return
@@ -146,7 +169,7 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 		if err != nil {
 			s.logger.Warn("scan failed",
 				"scanner", scanner.Name(),
-				"subnet", sc.Prefix.String(),
+				"subnet", subnetStr,
 				"err", err,
 				"duration", duration,
 			)
@@ -160,21 +183,46 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 			continue
 		}
 
+		scannersRun = append(scannersRun, scanner.Name())
+		totalHosts += len(results)
+
 		for _, r := range results {
 			record := state.HostRecord{
-				IP:            r.IP,
-				MAC:           r.MAC,
-				Alive:         r.Alive,
-				LastSeen:      r.Timestamp,
-				Hostnames:     r.Hostnames,
-				DNSMismatches: r.DNSMismatches,
-				OpenPorts:     r.OpenPorts,
+				IP:               r.IP,
+				MAC:              r.MAC,
+				Alive:            r.Alive,
+				LastSeen:         r.Timestamp,
+				Hostnames:        r.Hostnames,
+				DNSMismatches:    r.DNSMismatches,
+				OpenPorts:        r.OpenPorts,
+				DuplicateMACs:    r.DuplicateMACs,
+				DuplicateChecked: r.DuplicateChecked,
 			}
-			if err := s.store.UpdateHost(ctx, record); err != nil {
+			if s.ouiDB != nil && len(r.MAC) >= 3 {
+				record.Vendor = s.ouiDB.Lookup(r.MAC)
+			}
+			change, err := s.store.UpdateHost(ctx, record)
+			if err != nil {
 				s.logger.Warn("failed to update host",
 					"ip", r.IP.String(),
 					"err", err,
 				)
+				continue
+			}
+
+			// Emit audit events based on what changed.
+			ip := net.ParseIP(r.IP.String())
+			if change.IsNew {
+				hostname := ""
+				if len(r.Hostnames) > 0 {
+					hostname = r.Hostnames[0]
+				}
+				s.auditLog.NewHost(ip, subnetStr, r.MAC, record.Vendor, hostname)
+			} else if change.MACChanged {
+				s.auditLog.MACIPChange(ip, subnetStr, change.OldMAC, r.MAC, change.OldVendor, record.Vendor)
+			}
+			if change.DuplicateDetected {
+				s.auditLog.DuplicateIP(ip, subnetStr, r.MAC, r.DuplicateMACs)
 			}
 		}
 
@@ -188,9 +236,43 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 
 		s.logger.Info("scan complete",
 			"scanner", scanner.Name(),
-			"subnet", sc.Prefix.String(),
+			"subnet", subnetStr,
 			"hosts_found", len(results),
 			"duration", duration,
 		)
+	}
+
+	s.auditLog.ScanCycleComplete(subnetStr, totalHosts, time.Since(cycleStart), scannersRun)
+
+	// Authorization check: run after all scanners so every discovered host is present.
+	if al, ok := s.allowlists[subnetStr]; ok && al != nil {
+		s.checkAuthorization(ctx, sc, al)
+	}
+}
+
+// checkAuthorization checks each known host in the subnet against the MAC allowlist,
+// updates authorization state in the store, and emits audit events for rogue devices.
+func (s *Scheduler) checkAuthorization(ctx context.Context, sc SubnetConfig, al *Allowlist) {
+	hosts, err := s.store.ListHosts(ctx, sc.Prefix)
+	if err != nil {
+		s.logger.Warn("checkAuthorization: ListHosts failed", "subnet", sc.Prefix, "err", err)
+		return
+	}
+	subnetStr := sc.Prefix.String()
+	for _, host := range hosts {
+		if len(host.MAC) == 0 {
+			continue
+		}
+		authorized := al.Contains(host.MAC)
+		host.AuthorizationChecked = true
+		host.Authorized = authorized
+		if _, err := s.store.UpdateHost(ctx, host); err != nil {
+			s.logger.Warn("checkAuthorization: UpdateHost failed", "ip", host.IP, "err", err)
+			continue
+		}
+		if !authorized {
+			ip := net.ParseIP(host.IP.String())
+			s.auditLog.UnauthorizedDevice(ip, subnetStr, host.MAC, host.Vendor)
+		}
 	}
 }
