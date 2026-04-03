@@ -401,3 +401,46 @@ audit:
 ```
 
 See [`docs/audit-logging.md`](docs/audit-logging.md) for the full event reference, log rotation guidance, and SIEM integration examples.
+
+---
+
+## Config Hot-Reload (SIGHUP)
+
+Send `SIGHUP` to apply configuration changes without restarting or losing scan state:
+
+```bash
+# systemd
+systemctl reload signet-exporter
+
+# manual
+kill -HUP $(pidof signet-exporter)
+```
+
+### What is reloadable
+
+| Setting | Reloadable? |
+|---------|-------------|
+| `subnets` — CIDR list, scan intervals | Yes — SIGHUP |
+| `subnets` — TCP ports per subnet | Yes — SIGHUP |
+| `subnets` — MAC allowlist file paths | Yes — SIGHUP |
+| TLS certificate contents | Yes — SIGHUP (cert rotation) |
+| `listen_address` | **No** — restart required |
+| `tls.*` (paths, min_version) | **No** — restart required |
+| `state.*` (backend, bolt path) | **No** — restart required |
+| `dns.*`, `scanner.*`, `oui_database` | **No** — restart required |
+| `audit.*` | **No** — restart required |
+
+### What happens on reload
+
+1. The config file is re-read from the same path used at startup.
+2. The reloadable subset is validated. **If validation fails, the old config stays active** — the exporter continues running unchanged and logs the error.
+3. If validation passes, changes are diffed and applied atomically:
+   - New subnets begin scanning immediately.
+   - Removed subnets exit after their current scan cycle completes.
+   - Interval, port, and allowlist changes take effect on the next scan cycle.
+4. TLS certificates are reloaded from disk (same paths as startup).
+5. All changes are logged in the audit trail with a `config_reloaded` event containing a human-readable diff.
+
+### Invalid config handling
+
+If the reloaded config contains an invalid CIDR, out-of-range port, or a missing allowlist file, the reload is rejected entirely — no partial changes are applied. The error is logged at ERROR level and the exporter continues with the previous configuration.

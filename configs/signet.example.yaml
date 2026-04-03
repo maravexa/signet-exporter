@@ -1,5 +1,11 @@
 # signet-exporter — full annotated example configuration
 # All duration values accept Go duration strings (e.g. 30s, 1m, 2h).
+#
+# Hot-reloadable via SIGHUP (no restart needed):
+#   subnets.*  — add/remove subnets, change scan intervals, ports, allowlist paths
+#
+# Requires restart to take effect:
+#   listen_address, tls.*, dns.*, scanner.*, state.*, oui_database, audit.*
 
 # Address and port on which the /metrics endpoint will be served.
 # NEVER bind to 0.0.0.0 in production; restrict to a management interface.

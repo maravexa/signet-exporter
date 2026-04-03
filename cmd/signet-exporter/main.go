@@ -175,11 +175,12 @@ func main() {
 
 	// Build scanner list. ARP and ICMP discover hosts; DNS enriches hostnames;
 	// port scanner probes open TCP ports — all run sequentially per scan cycle.
+	portScanner := scanner.NewPortScanner(store, subnetPorts, nil, cfg.Scanner.PortTimeout, cfg.Scanner.PortMaxWorkers, logger)
 	scanners := []scanner.Scanner{
 		scanner.NewARPScanner(cfg.Scanner.ARPTimeout, cfg.Scanner.ARPRateLimit, logger),
 		scanner.NewICMPScanner(cfg.Scanner.ICMPTimeout, cfg.Scanner.ICMPRateLimit, logger),
 		scanner.NewDNSScanner(store, cfg.DNS.Servers, cfg.DNS.Timeout, logger),
-		scanner.NewPortScanner(store, subnetPorts, nil, cfg.Scanner.PortTimeout, cfg.Scanner.PortMaxWorkers, logger),
+		portScanner,
 	}
 
 	// Load OUI vendor database if configured; failure is non-fatal (degraded mode).
@@ -228,9 +229,12 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// SIGHUP handler — reloads TLS certificates without restarting.
+	// Track the current reloadable config for diffing on subsequent reloads.
+	currentRC := config.ExtractReloadable(cfg)
+
+	// SIGHUP handler — reloads both the config file and TLS certificates without restarting.
 	// Uses a buffered channel of size 1 so a rapid signal burst doesn't queue.
-	if srv.Reloader() != nil {
+	{
 		sighup := make(chan os.Signal, 1)
 		signal.Notify(sighup, syscall.SIGHUP)
 		go func() {
@@ -239,12 +243,92 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-sighup:
-					reloadErr := srv.Reloader().Reload()
-					auditLogger.CertReloaded(cfg.TLS.CertFile, reloadErr)
-					if reloadErr != nil {
-						logger.Error("TLS certificate reload failed", "err", reloadErr)
+					// --- Config hot-reload ---
+					newCfg, cfgErr := config.LoadConfig(*configPath)
+					if cfgErr != nil {
+						logger.Error("SIGHUP: failed to read config file — keeping old config", "err", cfgErr)
 					} else {
-						logger.Info("TLS certificate reloaded successfully")
+						newRC := config.ExtractReloadable(newCfg)
+						if valErr := config.ValidateReloadable(newRC); valErr != nil {
+							logger.Error("SIGHUP: new config failed validation — keeping old config", "err", valErr)
+						} else {
+							changes := config.Diff(currentRC, newRC)
+							if len(changes) > 0 {
+								// Load new allowlists from updated file paths.
+								newAllowlists := make(map[string]*scanner.Allowlist)
+								loadErr := false
+								for _, s := range newRC.Subnets {
+									if s.MACAllowlistFile == "" {
+										continue
+									}
+									prefix, _ := netip.ParsePrefix(s.CIDR)
+									al, alErr := scanner.LoadAllowlist(s.MACAllowlistFile)
+									if alErr != nil {
+										logger.Error("SIGHUP: failed to load allowlist — keeping old config",
+											"subnet", s.CIDR, "path", s.MACAllowlistFile, "err", alErr)
+										loadErr = true
+										break
+									}
+									if al != nil {
+										newAllowlists[prefix.String()] = al
+									}
+								}
+								if !loadErr {
+									// Build updated subnet list for the scheduler.
+									newSubnets := make([]scanner.SubnetConfig, 0, len(newRC.Subnets))
+									for _, s := range newRC.Subnets {
+										prefix, _ := netip.ParsePrefix(s.CIDR)
+										interval := s.ScanInterval
+										if interval == 0 {
+											interval = 60 * time.Second
+										}
+										newSubnets = append(newSubnets, scanner.SubnetConfig{
+											Prefix:       prefix,
+											ScanInterval: interval,
+										})
+									}
+									sched.ApplyConfig(scanner.ApplyConfigParams{
+										Subnets:    newSubnets,
+										Allowlists: newAllowlists,
+									})
+
+									// Update port scanner with new per-subnet ports.
+									newSubnetPorts := make(map[string][]uint16)
+									for _, s := range newRC.Subnets {
+										if len(s.Ports) == 0 {
+											continue
+										}
+										prefix, _ := netip.ParsePrefix(s.CIDR)
+										ports := make([]uint16, len(s.Ports))
+										for i, p := range s.Ports {
+											ports[i] = uint16(p) //nolint:gosec // port validated 1–65535
+										}
+										newSubnetPorts[prefix.String()] = ports
+									}
+									portScanner.UpdatePorts(newSubnetPorts)
+
+									currentRC = newRC
+									auditLogger.ConfigReloaded(changes)
+									logger.Info("SIGHUP: config reloaded", "changes", len(changes))
+									for _, c := range changes {
+										logger.Info("SIGHUP: change", "detail", c)
+									}
+								}
+							} else {
+								logger.Info("SIGHUP: config unchanged")
+							}
+						}
+					}
+
+					// --- TLS cert rotation (existing Step 12 behaviour) ---
+					if srv.Reloader() != nil {
+						reloadErr := srv.Reloader().Reload()
+						auditLogger.CertReloaded(cfg.TLS.CertFile, reloadErr)
+						if reloadErr != nil {
+							logger.Error("TLS certificate reload failed", "err", reloadErr)
+						} else {
+							logger.Info("TLS certificate reloaded successfully")
+						}
 					}
 				}
 			}

@@ -19,18 +19,36 @@ type SubnetConfig struct {
 	ScanInterval time.Duration
 }
 
+// ApplyConfigParams carries mutable configuration for a live config reload.
+// Passed to Scheduler.ApplyConfig from the SIGHUP handler.
+type ApplyConfigParams struct {
+	Subnets    []SubnetConfig        // updated subnet list (Prefix + ScanInterval)
+	Allowlists map[string]*Allowlist // prefix string → allowlist; nil entry = no auth check
+}
+
 // Scheduler drives periodic subnet scans with a configurable concurrency limit.
 type Scheduler struct {
-	scanners   []Scanner
-	store      state.Store
-	ouiDB      *oui.Database         // may be nil when no OUI file is configured
-	auditLog   *audit.Logger         // never nil after construction; disabled logger used as no-op
-	allowlists map[string]*Allowlist // key: subnet prefix string; nil map = no allowlists configured
-	subnets    []SubnetConfig
-	semaphore  chan struct{} // limits the number of concurrent subnet scans in flight
-	logger     *slog.Logger
-	readyCh    chan struct{} // closed after every configured subnet completes its first scan
-	readyOnce  sync.Once
+	// Immutable after construction — no lock required.
+	scanners  []Scanner
+	store     state.Store
+	ouiDB     *oui.Database // may be nil when no OUI file is configured
+	auditLog  *audit.Logger // never nil after construction; disabled logger used as no-op
+	semaphore chan struct{} // limits the number of concurrent subnet scans in flight
+	logger    *slog.Logger
+	readyCh   chan struct{} // closed after every configured subnet completes its first scan
+	readyOnce sync.Once
+	wg        sync.WaitGroup // tracks all active per-subnet goroutines
+
+	// Mutable — protected by mu. Written by ApplyConfig (SIGHUP goroutine),
+	// read by per-subnet scan goroutines. Lock is held for microseconds only.
+	mu         sync.RWMutex
+	subnets    []SubnetConfig        // current subnet list
+	allowlists map[string]*Allowlist // key: subnet prefix string; nil map = no allowlists
+
+	// runCtx is set by Run() and used by ApplyConfig to start goroutines for new subnets.
+	// Written once by Run() under mu before any goroutines read it; safe to read without lock
+	// after Run() starts.
+	runCtx context.Context //nolint:containedctx
 }
 
 // NewScheduler creates a Scheduler.
@@ -81,26 +99,82 @@ func (s *Scheduler) Ready() <-chan struct{} {
 	return s.readyCh
 }
 
+// ApplyConfig atomically replaces the mutable configuration snapshot.
+// Changes take effect on the next scan cycle for each subnet — in-progress scans
+// are never interrupted.
+//
+// New subnets in params.Subnets that were not present before are started immediately.
+// Subnets removed from params.Subnets will exit after their current scan cycle completes.
+// Safe to call from the SIGHUP goroutine while scan goroutines are running.
+func (s *Scheduler) ApplyConfig(params ApplyConfigParams) {
+	s.mu.Lock()
+	oldSubnets := s.subnets
+	s.subnets = params.Subnets
+	s.allowlists = params.Allowlists
+	runCtx := s.runCtx
+	s.mu.Unlock()
+
+	if runCtx == nil {
+		// Run() has not been called yet; new subnets will be started by Run().
+		return
+	}
+
+	// Start goroutines for newly-added subnets.
+	oldPrefixes := make(map[netip.Prefix]bool, len(oldSubnets))
+	for _, sc := range oldSubnets {
+		oldPrefixes[sc.Prefix] = true
+	}
+	for _, sc := range params.Subnets {
+		if !oldPrefixes[sc.Prefix] {
+			s.wg.Add(1)
+			prefix := sc.Prefix
+			go func() {
+				defer s.wg.Done()
+				firstDone := make(chan struct{})
+				s.runSubnet(runCtx, prefix, firstDone)
+			}()
+		}
+	}
+}
+
+// subnetByPrefix returns the SubnetConfig for the given prefix.
+// Caller must hold mu for reading (mu.RLock).
+func (s *Scheduler) subnetByPrefix(prefix netip.Prefix) (SubnetConfig, bool) {
+	for _, sc := range s.subnets {
+		if sc.Prefix == prefix {
+			return sc, true
+		}
+	}
+	return SubnetConfig{}, false
+}
+
 // Run starts a per-subnet goroutine for each configured subnet and blocks until
 // ctx is cancelled. On cancellation, all goroutines drain and Run returns nil.
 func (s *Scheduler) Run(ctx context.Context) error {
-	if len(s.subnets) == 0 {
+	// Record run context and snapshot initial subnet list under a single lock.
+	s.mu.Lock()
+	s.runCtx = ctx
+	subnets := append([]SubnetConfig{}, s.subnets...)
+	s.mu.Unlock()
+
+	if len(subnets) == 0 {
 		// No subnets configured — signal ready immediately and wait for shutdown.
 		s.readyOnce.Do(func() { close(s.readyCh) })
 		<-ctx.Done()
+		s.wg.Wait()
 		return nil
 	}
 
-	var wg sync.WaitGroup
-	firstScans := make([]chan struct{}, len(s.subnets))
-
-	for i := range s.subnets {
+	firstScans := make([]chan struct{}, len(subnets))
+	for i, sc := range subnets {
 		firstScans[i] = make(chan struct{})
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			s.runSubnet(ctx, s.subnets[i], firstScans[i])
-		}(i)
+		s.wg.Add(1)
+		prefix := sc.Prefix
+		i := i
+		go func() {
+			defer s.wg.Done()
+			s.runSubnet(ctx, prefix, firstScans[i])
+		}()
 	}
 
 	// Readiness waiter: closes readyCh once every subnet has finished its first scan.
@@ -115,12 +189,25 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		s.readyOnce.Do(func() { close(s.readyCh) })
 	}()
 
-	wg.Wait()
+	<-ctx.Done()
+	s.wg.Wait()
 	return nil
 }
 
-// runSubnet runs an immediate first scan, signals completion, then ticks periodically.
-func (s *Scheduler) runSubnet(ctx context.Context, sc SubnetConfig, firstScanDone chan<- struct{}) {
+// runSubnet runs an immediate first scan, signals completion, then waits the current
+// scan interval (re-read from the config snapshot each cycle) before scanning again.
+// Exits when ctx is cancelled or the subnet is removed from the config snapshot.
+func (s *Scheduler) runSubnet(ctx context.Context, prefix netip.Prefix, firstScanDone chan<- struct{}) {
+	// Read initial config.
+	s.mu.RLock()
+	sc, found := s.subnetByPrefix(prefix)
+	s.mu.RUnlock()
+	if !found {
+		// Subnet was removed before first scan (race between ApplyConfig and goroutine start).
+		close(firstScanDone)
+		return
+	}
+
 	// Immediate first scan — don't wait for the first tick.
 	s.scanSubnet(ctx, sc)
 
@@ -128,16 +215,33 @@ func (s *Scheduler) runSubnet(ctx context.Context, sc SubnetConfig, firstScanDon
 	// This unblocks the readiness waiter and avoids a deadlock on shutdown.
 	close(firstScanDone)
 
-	ticker := time.NewTicker(sc.ScanInterval)
-	defer ticker.Stop()
-
 	for {
+		// Re-read config at the start of each wait cycle.
+		// This picks up interval changes and detects subnet removal.
+		s.mu.RLock()
+		sc, found = s.subnetByPrefix(prefix)
+		s.mu.RUnlock()
+		if !found {
+			return // subnet removed by ApplyConfig
+		}
+
+		t := time.NewTimer(sc.ScanInterval)
 		select {
 		case <-ctx.Done():
+			t.Stop()
 			return
-		case <-ticker.C:
-			s.scanSubnet(ctx, sc)
+		case <-t.C:
 		}
+
+		// Re-read after the timer fires — config may have changed while we waited.
+		s.mu.RLock()
+		sc, found = s.subnetByPrefix(prefix)
+		s.mu.RUnlock()
+		if !found {
+			return
+		}
+
+		s.scanSubnet(ctx, sc)
 	}
 }
 
@@ -246,8 +350,11 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 
 	s.auditLog.ScanCycleComplete(subnetStr, totalHosts, time.Since(cycleStart), scannersRun)
 
-	// Authorization check: run after all scanners so every discovered host is present.
-	if al, ok := s.allowlists[subnetStr]; ok && al != nil {
+	// Authorization check: read allowlist under lock for hot-reload safety.
+	s.mu.RLock()
+	al := s.allowlists[subnetStr]
+	s.mu.RUnlock()
+	if al != nil {
 		s.checkAuthorization(ctx, sc, al)
 	}
 }

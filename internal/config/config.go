@@ -9,18 +9,23 @@ import (
 )
 
 // Config is the top-level configuration structure for signet-exporter.
+//
+// Fields marked HOT-RELOAD are applied on SIGHUP without restarting.
+// Fields marked IMMUTABLE require a full restart to take effect.
 type Config struct {
-	ListenAddress string         `yaml:"listen_address"`
-	TLS           TLSConfig      `yaml:"tls"`
-	Subnets       []SubnetConfig `yaml:"subnets"`
-	DNS           DNSConfig      `yaml:"dns"`
-	Scanner       ScannerConfig  `yaml:"scanner"`
-	State         StateConfig    `yaml:"state"`
-	OUIDatabase   string         `yaml:"oui_database"`
-	Audit         AuditConfig    `yaml:"audit"`
+	ListenAddress string         `yaml:"listen_address"` // IMMUTABLE: socket rebind required
+	TLS           TLSConfig      `yaml:"tls"`            // IMMUTABLE: see TLSConfig comment
+	Subnets       []SubnetConfig `yaml:"subnets"`        // HOT-RELOAD: CIDRs, intervals, ports, allowlists
+	DNS           DNSConfig      `yaml:"dns"`            // IMMUTABLE
+	Scanner       ScannerConfig  `yaml:"scanner"`        // IMMUTABLE
+	State         StateConfig    `yaml:"state"`          // IMMUTABLE: see StateConfig comment
+	OUIDatabase   string         `yaml:"oui_database"`   // IMMUTABLE
+	Audit         AuditConfig    `yaml:"audit"`          // IMMUTABLE
 }
 
 // TLSConfig holds TLS and mTLS settings for the metrics endpoint.
+// IMMUTABLE: changing these fields requires a restart. Certificate contents
+// rotate on SIGHUP via the KeypairReloader without changing the paths.
 type TLSConfig struct {
 	CertFile         string `yaml:"cert_file"`
 	KeyFile          string `yaml:"key_file"`
@@ -55,6 +60,7 @@ type ScannerConfig struct {
 }
 
 // StateConfig holds configuration for the state persistence backend.
+// IMMUTABLE: switching backends or changing the bolt path requires a restart.
 type StateConfig struct {
 	Backend  string `yaml:"backend"` // "memory" or "bolt"
 	BoltPath string `yaml:"bolt_path"`
