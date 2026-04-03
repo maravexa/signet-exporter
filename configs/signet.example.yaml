@@ -26,7 +26,7 @@ subnets:
     # Path to a newline-delimited file of authorized MAC addresses (one per line,
     # colon-separated, e.g. "aa:bb:cc:dd:ee:ff"). Devices not in this list will
     # trigger signet_unauthorized_device_detected = 1.
-    mac_allowlist_file: "/etc/signet/allowlists/10.0.1.allowlist"
+    #mac_allowlist_file: "/etc/signet/allowlists/10.0.1.allowlist"
 
   - cidr: "10.0.2.0/24"
     scan_interval: 5m

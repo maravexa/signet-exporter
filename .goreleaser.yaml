@@ -119,7 +119,7 @@ nfpms:
         dst: /etc/signet/signet.yaml
         type: config
         file_info:
-          mode: 0640
+          mode: 0644
           owner: root
           group: signet
 
@@ -155,6 +155,30 @@ nfpms:
         file_info:
           mode: 0750
           owner: signet
+          group: signet
+      
+      # Audit log directory
+      - dst: /var/log/signet
+        type: dir
+        file_info:
+          mode: 0750
+          owner: signet
+          group: signet
+
+      # Allowlist directory
+      - dst: /etc/signet/allowlists
+        type: dir
+        file_info:
+          mode: 0750
+          owner: root
+          group: signet
+
+      # TLS certificate directory
+      - dst: /etc/signet/tls
+        type: dir
+        file_info:
+          mode: 0750
+          owner: root
           group: signet
 
     scripts:
