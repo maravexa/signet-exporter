@@ -21,3 +21,6 @@ install -d -m 755 /usr/share/signet
 if [ -f /usr/share/signet/oui.txt ]; then
     chown signet:signet /usr/share/signet/oui.txt
 fi
+
+# Set ownership for /var/log/signet
+chown signet:signet /var/log/signet
