@@ -106,7 +106,6 @@ nfpms:
 
     overrides:
       rpm:
-        group: Monitoring
         dependencies:
           - libcap
       archlinux:
