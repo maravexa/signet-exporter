@@ -16,6 +16,7 @@ import (
 	"github.com/maravexa/signet-exporter/internal/audit"
 	"github.com/maravexa/signet-exporter/internal/collector"
 	"github.com/maravexa/signet-exporter/internal/config"
+	"github.com/maravexa/signet-exporter/internal/fips"
 	"github.com/maravexa/signet-exporter/internal/oui"
 	"github.com/maravexa/signet-exporter/internal/scanner"
 	"github.com/maravexa/signet-exporter/internal/server"
@@ -35,8 +36,8 @@ func main() {
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("signet-exporter %s (commit: %s, built: %s)\n",
-			version.Version, version.Commit, version.Date)
+		fmt.Printf("signet-exporter %s (commit: %s, built: %s, fips=%v)\n",
+			version.Version, version.Commit, version.Date, fips.Enabled())
 		os.Exit(0)
 	}
 
@@ -257,11 +258,18 @@ func main() {
 		}
 	}()
 
+	if fips.Enabled() {
+		logger.Info("FIPS mode enabled")
+	} else {
+		logger.Info("FIPS mode not enabled (standard crypto)")
+	}
+
 	logger.Info("starting signet-exporter",
 		"version", version.Version,
 		"commit", version.Commit,
 		"address", cfg.ListenAddress,
 		"tls", srv.TLSEnabled(),
+		"fips", fips.Enabled(),
 		"subnets", len(cfg.Subnets),
 		"scanners", len(scanners),
 	)

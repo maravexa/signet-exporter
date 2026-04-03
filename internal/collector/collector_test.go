@@ -724,6 +724,26 @@ func TestCollect_DuplicateIPDetected(t *testing.T) {
 	}
 }
 
+func TestCollect_FIPSEnabled(t *testing.T) {
+	store := state.NewMemoryStore()
+	c := newTestCollector(store)
+
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_exporter_fips_enabled")
+	if fam == nil {
+		t.Fatal("signet_exporter_fips_enabled not emitted")
+	}
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(fam.GetMetric()))
+	}
+	// In a normal (non-boringcrypto) test build, FIPS must be disabled.
+	val := fam.GetMetric()[0].GetGauge().GetValue()
+	if val != 0.0 {
+		t.Errorf("signet_exporter_fips_enabled = %v in non-boringcrypto build, want 0", val)
+	}
+}
+
 func TestCollect_NoScanMeta_NoEmission(t *testing.T) {
 	store := state.NewMemoryStore()
 	subnet := "10.0.7.0/24"
