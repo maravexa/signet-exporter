@@ -156,7 +156,7 @@ func randomSerial() *big.Int {
 }
 
 func writeCert(path string, der []byte) error {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return fmt.Errorf("create cert file %q: %w", path, err)
 	}
@@ -169,7 +169,7 @@ func writeKey(path string, key *ecdsa.PrivateKey) error {
 	if err != nil {
 		return fmt.Errorf("marshal EC key: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("create key file %q: %w", path, err)
 	}

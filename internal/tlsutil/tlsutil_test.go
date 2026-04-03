@@ -84,7 +84,7 @@ func TestBuildTLSConfig_InvalidCertPath(t *testing.T) {
 func TestBuildTLSConfig_InvalidClientCA(t *testing.T) {
 	cs := generateTestCerts(t)
 	badCA := filepath.Join(t.TempDir(), "bad-ca.pem")
-	if err := os.WriteFile(badCA, []byte("not valid PEM"), 0644); err != nil {
+	if err := os.WriteFile(badCA, []byte("not valid PEM"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	_, err := tlsutil.BuildTLSConfig(cs.serverCert, cs.serverKey, badCA, "")
@@ -112,10 +112,10 @@ func TestBuildTLSConfig_CipherSuites(t *testing.T) {
 	}
 
 	want := map[uint16]bool{
-		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:        true,
-		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:        true,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:      true,
-		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:      true,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256:         true,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384:         true,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:       true,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384:       true,
 		tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256:   true,
 		tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256: true,
 	}
@@ -169,10 +169,10 @@ func TestKeypairReloader_Reload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(cs.serverCert, newCert, 0644); err != nil {
+	if err := os.WriteFile(cs.serverCert, newCert, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(cs.serverKey, newKey, 0600); err != nil {
+	if err := os.WriteFile(cs.serverKey, newKey, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -196,7 +196,7 @@ func TestKeypairReloader_ReloadInvalid(t *testing.T) {
 	certBefore, _ := kr.GetCertificate(nil)
 
 	// Overwrite the cert file with garbage; key is still valid.
-	if err := os.WriteFile(cs.serverCert, []byte("this is not a valid certificate"), 0644); err != nil {
+	if err := os.WriteFile(cs.serverCert, []byte("this is not a valid certificate"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

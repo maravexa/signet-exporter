@@ -117,7 +117,7 @@ func buildTLSConfig(cfg *config.TLSConfig) (*tls.Config, *tlsutil.KeypairReloade
 		minVer = tls.VersionTLS12
 	}
 
-	tlsCfg := &tls.Config{
+	tlsCfg := &tls.Config{ //nolint:gosec // G402: TLS 1.2 is intentional — operator controls min_version; AEAD-only ciphers are enforced below.
 		MinVersion:     minVer,
 		GetCertificate: reloader.GetCertificate,
 		// Restrict TLS 1.2 to AEAD-only cipher suites. TLS 1.3 ciphers are
