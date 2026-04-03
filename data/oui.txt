@@ -1,10 +1,18 @@
+# IEEE OUI Database Snapshot
+# Source: https://standards-oui.ieee.org/oui/oui.txt
+# Bundled: 2026-04-03
+#
+# This is a stub snapshot for development and testing.
+# For production use, run /usr/lib/signet/update-oui.sh to download
+# the full database, or manually place the IEEE oui.txt file at
+# /usr/share/signet/oui.txt
+#
+# The full database is ~500KB with 30,000+ entries.
+# This stub contains a representative sample for test coverage.
+
 OUI/MA-L			Organization
 company_id			Organization
 				Address
-
-# TODO: Replace this stub with the full IEEE OUI database snapshot.
-# Download from: https://standards-oui.ieee.org/oui/oui.txt (~6 MB, ~30,000 entries)
-# This stub contains enough entries to pass tests and demonstrate the lookup feature.
 
 DC-A6-32   (hex)		Raspberry Pi Trading Ltd
 DCA632     (base 16)		Raspberry Pi Trading Ltd

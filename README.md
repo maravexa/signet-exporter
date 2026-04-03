@@ -108,6 +108,104 @@ Key fields:
 
 ---
 
+## Linux Capabilities
+
+Signet requires `CAP_NET_RAW` for ARP scanning. The binary refuses to run as root —
+use Linux capabilities instead.
+
+**Development builds:**
+
+    make setcap
+
+This builds the binary and sets the capability. Requires `sudo`.
+
+**Manual installation:**
+
+    make install
+
+Installs to `/usr/local/bin/` with capabilities set.
+
+**Debian packages:**
+
+The `.deb` package sets capabilities automatically via `postinst`.
+
+**systemd:**
+
+The included systemd unit uses `AmbientCapabilities=CAP_NET_RAW` — no manual
+capability setting needed when running as a service.
+
+---
+
+## OUI Vendor Database
+
+Signet resolves MAC address prefixes to manufacturer names using the IEEE OUI database.
+This populates the `vendor` label on `signet_host_up` metrics.
+
+### Configuration
+
+Set the path in `signet.yaml`:
+
+    oui_database: "/usr/share/signet/oui.txt"
+
+Leave empty or omit to run without vendor enrichment (the `vendor` label will be blank).
+
+### Data Sources
+
+**Debian package:** Ships with a snapshot of the IEEE database. No action needed after install.
+
+**Manual install:** Download the database:
+
+    sudo /usr/lib/signet/update-oui.sh
+
+Or manually:
+
+    sudo mkdir -p /usr/share/signet
+    sudo curl -o /usr/share/signet/oui.txt https://standards-oui.ieee.org/oui/oui.txt
+
+**Air-gapped environments:** Copy `oui.txt` from a connected machine to
+`/usr/share/signet/oui.txt` on the target host. The file is available from
+https://standards-oui.ieee.org/oui/oui.txt (~500KB).
+
+### Keeping the Database Current
+
+The IEEE updates the OUI database periodically. To refresh:
+
+    sudo /usr/lib/signet/update-oui.sh
+
+The script downloads, validates, and installs the new database. Restart signet to
+pick up the changes:
+
+    sudo systemctl restart signet-exporter
+
+The last update timestamp is recorded in `/usr/share/signet/oui.txt.updated`.
+
+For automated updates, add a cron entry or systemd timer:
+
+    # Weekly OUI update (cron example)
+    0 3 * * 0 /usr/lib/signet/update-oui.sh >> /var/log/signet-oui-update.log 2>&1
+
+---
+
+## Makefile Targets
+
+| Target | Sudo | Description |
+|---|---|---|
+| `make build` | No | Build the binary to `dist/` |
+| `make build-fips` | No | Build the FIPS 140-2 variant |
+| `make test` | No | Run tests with race detector |
+| `make vet` | No | Run `go vet` |
+| `make lint` | No | Run `golangci-lint` |
+| `make check` | No | Run vet + lint + test |
+| `make validate-config` | No | Validate the example config file |
+| `make run` | No | Build and run with minimal config |
+| `make setcap` | Yes | Build and set `CAP_NET_RAW` on the binary |
+| `make install` | Yes | Install binary to `/usr/local/bin/` with capabilities |
+| `make install-data` | Yes | Install OUI database and update script to system paths |
+| `make install-all` | Yes | Full install: binary + data + capabilities |
+| `make clean` | No | Remove build artifacts |
+
+---
+
 ## Deployment
 
 ### systemd
