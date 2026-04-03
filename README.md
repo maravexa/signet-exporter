@@ -286,3 +286,15 @@ Kubernetes deployment manifests are planned for a future release. The exporter r
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+
+---
+
+## Prometheus Scrape Config
+
+```yaml
+- job_name: "signet"
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ["127.0.0.1:9420"]
+```
