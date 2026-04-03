@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/maravexa/signet-exporter/internal/audit"
 	"github.com/maravexa/signet-exporter/internal/collector"
 	"github.com/maravexa/signet-exporter/internal/config"
 	"github.com/maravexa/signet-exporter/internal/oui"
@@ -131,8 +132,19 @@ func main() {
 		}
 	}
 
+	// Create structured audit logger. Failure is fatal — don't run without audit if configured.
+	auditLogger, err := audit.NewLogger(audit.Config{
+		Enabled: cfg.Audit.Enabled,
+		Output:  cfg.Audit.Output,
+	})
+	if err != nil {
+		logger.Error("failed to create audit logger", "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = auditLogger.Close() }()
+
 	signetCollector := collector.NewSignetCollector(store, prefixes, logger)
-	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger, ouiDB)
+	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger, ouiDB, auditLogger)
 
 	if cfg.TLS.CertFile == "" {
 		logger.Warn("TLS not configured — serving metrics over plaintext HTTP; not recommended for production")

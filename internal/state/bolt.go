@@ -22,10 +22,10 @@ func NewBoltStore(path string) (*BoltStore, error) {
 	return &BoltStore{db: db}, nil
 }
 
-// UpdateHost inserts or updates a host record.
-func (b *BoltStore) UpdateHost(_ context.Context, _ HostRecord) error {
+// UpdateHost inserts or updates a host record and reports what changed.
+func (b *BoltStore) UpdateHost(_ context.Context, _ HostRecord) (HostChange, error) {
 	// TODO: implement bbolt-backed host record persistence
-	return nil
+	return HostChange{}, nil
 }
 
 // GetHost retrieves a host record by IP address.

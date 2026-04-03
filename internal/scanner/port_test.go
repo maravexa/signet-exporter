@@ -111,7 +111,7 @@ func TestPortScan_FullCycle(t *testing.T) {
 	ip := netip.MustParseAddr("127.0.0.1")
 	subnet := netip.MustParsePrefix("127.0.0.1/32")
 
-	_ = store.UpdateHost(context.Background(), state.HostRecord{
+	_, _ = store.UpdateHost(context.Background(), state.HostRecord{
 		IP:       ip,
 		LastSeen: time.Now(),
 		Alive:    true,
@@ -195,7 +195,7 @@ func TestPortScan_MultipleHosts(t *testing.T) {
 	subnet := netip.MustParsePrefix("127.0.0.0/24")
 
 	for _, ip := range []netip.Addr{ip1, ip2} {
-		_ = store.UpdateHost(context.Background(), state.HostRecord{
+		_, _ = store.UpdateHost(context.Background(), state.HostRecord{
 			IP:       ip,
 			LastSeen: time.Now(),
 			Alive:    true,
@@ -230,7 +230,7 @@ func TestPortScan_WorkerPoolLimiting(t *testing.T) {
 	// Insert 20 hosts — all pointing to loopback (will connect to the same listener).
 	for i := 1; i <= 20; i++ {
 		ip := netip.AddrFrom4([4]byte{127, 0, 0, byte(i)})
-		_ = store.UpdateHost(context.Background(), state.HostRecord{
+		_, _ = store.UpdateHost(context.Background(), state.HostRecord{
 			IP:       ip,
 			LastSeen: time.Now(),
 			Alive:    true,
@@ -265,7 +265,7 @@ func TestPortScan_SubnetSpecificPorts(t *testing.T) {
 	for _, h := range []struct {
 		ip netip.Addr
 	}{{ipA}, {ipB}} {
-		_ = store.UpdateHost(context.Background(), state.HostRecord{
+		_, _ = store.UpdateHost(context.Background(), state.HostRecord{
 			IP:       h.ip,
 			LastSeen: time.Now(),
 			Alive:    true,

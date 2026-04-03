@@ -39,7 +39,7 @@ func TestUpdateHost_NewHost(t *testing.T) {
 	rec.LastSeen = time.Unix(1000, 0)
 	rec.FirstSeen = time.Time{} // zero — should be set by store
 
-	if err := m.UpdateHost(ctx, rec); err != nil {
+	if _, err := m.UpdateHost(ctx, rec); err != nil {
 		t.Fatalf("UpdateHost error: %v", err)
 	}
 
@@ -78,7 +78,7 @@ func TestUpdateHost_SameMAC_UpdatesFields(t *testing.T) {
 	m := NewMemoryStore()
 	rec := makeTestRecord("10.0.1.2", "aa:bb:cc:dd:ee:01")
 	rec.LastSeen = time.Unix(1000, 0)
-	if err := m.UpdateHost(ctx, rec); err != nil {
+	if _, err := m.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -90,7 +90,7 @@ func TestUpdateHost_SameMAC_UpdatesFields(t *testing.T) {
 	rec2.LastSeen = time.Unix(2000, 0)
 	rec2.Hostnames = []string{"updated-host"}
 	rec2.OpenPorts = []uint16{443}
-	if err := m.UpdateHost(ctx, rec2); err != nil {
+	if _, err := m.UpdateHost(ctx, rec2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -119,7 +119,7 @@ func TestUpdateHost_DifferentMAC_RecordsChange(t *testing.T) {
 
 	recA := makeTestRecord(ip, macA)
 	recA.LastSeen = time.Unix(1000, 0)
-	if err := m.UpdateHost(ctx, recA); err != nil {
+	if _, err := m.UpdateHost(ctx, recA); err != nil {
 		t.Fatal(err)
 	}
 	got1, _ := m.GetHost(ctx, recA.IP)
@@ -127,7 +127,7 @@ func TestUpdateHost_DifferentMAC_RecordsChange(t *testing.T) {
 
 	recB := makeTestRecord(ip, macB)
 	recB.LastSeen = time.Unix(2000, 0)
-	if err := m.UpdateHost(ctx, recB); err != nil {
+	if _, err := m.UpdateHost(ctx, recB); err != nil {
 		t.Fatal(err)
 	}
 
@@ -181,7 +181,7 @@ func TestUpdateHost_DifferentMAC_MultipleChanges(t *testing.T) {
 	for i, mac := range macs {
 		rec := makeTestRecord(ip, mac)
 		rec.LastSeen = time.Unix(int64(1000+i), 0)
-		if err := m.UpdateHost(ctx, rec); err != nil {
+		if _, err := m.UpdateHost(ctx, rec); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -234,7 +234,7 @@ func TestGetHost_ReturnsCopy(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemoryStore()
 	rec := makeTestRecord("10.0.1.5", "bb:bb:bb:bb:bb:bb")
-	if err := m.UpdateHost(ctx, rec); err != nil {
+	if _, err := m.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -266,7 +266,7 @@ func TestListHosts_SubnetFiltering(t *testing.T) {
 
 	mac := "cc:cc:cc:cc:cc:cc"
 	for _, ip := range append(hosts1, hosts2...) {
-		if err := m.UpdateHost(ctx, makeTestRecord(ip, mac)); err != nil {
+		if _, err := m.UpdateHost(ctx, makeTestRecord(ip, mac)); err != nil {
 			t.Fatal(err)
 		}
 		// Use distinct MACs to avoid MAC-change events
@@ -295,7 +295,7 @@ func TestListHosts_SubnetFiltering(t *testing.T) {
 func TestListHosts_EmptySubnet(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemoryStore()
-	if err := m.UpdateHost(ctx, makeTestRecord("10.0.1.1", "dd:dd:dd:dd:dd:dd")); err != nil {
+	if _, err := m.UpdateHost(ctx, makeTestRecord("10.0.1.1", "dd:dd:dd:dd:dd:dd")); err != nil {
 		t.Fatal(err)
 	}
 	got, err := m.ListHosts(ctx, mustParsePrefix("192.168.100.0/24"))
@@ -384,7 +384,7 @@ func TestSubnetUtilization(t *testing.T) {
 
 	// Insert 3 hosts in /24
 	for _, ip := range []string{"10.1.1.1", "10.1.1.2", "10.1.1.3"} {
-		if err := m.UpdateHost(ctx, makeTestRecord(ip, uniqueMAC(ip))); err != nil {
+		if _, err := m.UpdateHost(ctx, makeTestRecord(ip, uniqueMAC(ip))); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -398,7 +398,7 @@ func TestSubnetUtilization(t *testing.T) {
 	}
 
 	// /32 with host present
-	if err := m.UpdateHost(ctx, makeTestRecord("10.1.2.1", "ee:ee:ee:ee:ee:ee")); err != nil {
+	if _, err := m.UpdateHost(ctx, makeTestRecord("10.1.2.1", "ee:ee:ee:ee:ee:ee")); err != nil {
 		t.Fatal(err)
 	}
 	used, total = m.SubnetUtilization(mustParsePrefix("10.1.2.1/32"))
@@ -429,10 +429,10 @@ func TestIPsForMAC(t *testing.T) {
 
 	rec1 := makeTestRecord(ip1, sharedMAC)
 	rec2 := makeTestRecord(ip2, sharedMAC)
-	if err := m.UpdateHost(ctx, rec1); err != nil {
+	if _, err := m.UpdateHost(ctx, rec1); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.UpdateHost(ctx, rec2); err != nil {
+	if _, err := m.UpdateHost(ctx, rec2); err != nil {
 		t.Fatal(err)
 	}
 
@@ -446,7 +446,7 @@ func TestIPsForMAC(t *testing.T) {
 	newMAC := "11:11:11:11:11:11"
 	rec1b := makeTestRecord(ip1, newMAC)
 	rec1b.LastSeen = rec1.LastSeen.Add(time.Second)
-	if err := m.UpdateHost(ctx, rec1b); err != nil {
+	if _, err := m.UpdateHost(ctx, rec1b); err != nil {
 		t.Fatal(err)
 	}
 
@@ -479,7 +479,7 @@ func TestConcurrency(t *testing.T) {
 				MAC:      mac,
 				LastSeen: time.Now(),
 			}
-			_ = m.UpdateHost(ctx, rec)
+			_, _ = m.UpdateHost(ctx, rec)
 		}(i)
 	}
 
@@ -502,7 +502,7 @@ func TestUpdateHost_MACChangeCount(t *testing.T) {
 	ip := "10.0.9.1"
 
 	// Initial insert — no MAC change yet.
-	if err := m.UpdateHost(ctx, makeTestRecord(ip, "aa:00:00:00:00:01")); err != nil {
+	if _, err := m.UpdateHost(ctx, makeTestRecord(ip, "aa:00:00:00:00:01")); err != nil {
 		t.Fatal(err)
 	}
 	got, _ := m.GetHost(ctx, netip.MustParseAddr(ip))
@@ -513,7 +513,7 @@ func TestUpdateHost_MACChangeCount(t *testing.T) {
 	// First MAC change.
 	rec2 := makeTestRecord(ip, "aa:00:00:00:00:02")
 	rec2.LastSeen = time.Now().Add(time.Second)
-	if err := m.UpdateHost(ctx, rec2); err != nil {
+	if _, err := m.UpdateHost(ctx, rec2); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = m.GetHost(ctx, netip.MustParseAddr(ip))
@@ -524,7 +524,7 @@ func TestUpdateHost_MACChangeCount(t *testing.T) {
 	// Second MAC change.
 	rec3 := makeTestRecord(ip, "aa:00:00:00:00:03")
 	rec3.LastSeen = time.Now().Add(2 * time.Second)
-	if err := m.UpdateHost(ctx, rec3); err != nil {
+	if _, err := m.UpdateHost(ctx, rec3); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = m.GetHost(ctx, netip.MustParseAddr(ip))
@@ -535,7 +535,7 @@ func TestUpdateHost_MACChangeCount(t *testing.T) {
 	// Same MAC update — count must not change.
 	rec4 := makeTestRecord(ip, "aa:00:00:00:00:03")
 	rec4.LastSeen = time.Now().Add(3 * time.Second)
-	if err := m.UpdateHost(ctx, rec4); err != nil {
+	if _, err := m.UpdateHost(ctx, rec4); err != nil {
 		t.Fatal(err)
 	}
 	got, _ = m.GetHost(ctx, netip.MustParseAddr(ip))
@@ -677,7 +677,7 @@ func TestUpdateHost_NilMAC_PreservesExisting(t *testing.T) {
 	// Insert host via simulated ARP result (has MAC).
 	arpRec := makeTestRecord(ip, mac)
 	arpRec.LastSeen = time.Unix(1000, 0)
-	if err := m.UpdateHost(ctx, arpRec); err != nil {
+	if _, err := m.UpdateHost(ctx, arpRec); err != nil {
 		t.Fatalf("UpdateHost (ARP): %v", err)
 	}
 
@@ -688,7 +688,7 @@ func TestUpdateHost_NilMAC_PreservesExisting(t *testing.T) {
 		Alive:    true,
 		LastSeen: time.Unix(2000, 0),
 	}
-	if err := m.UpdateHost(ctx, icmpRec); err != nil {
+	if _, err := m.UpdateHost(ctx, icmpRec); err != nil {
 		t.Fatalf("UpdateHost (ICMP): %v", err)
 	}
 

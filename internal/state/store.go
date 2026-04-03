@@ -3,14 +3,24 @@ package state
 
 import (
 	"context"
+	"net"
 	"net/netip"
 	"time"
 )
 
+// HostChange describes what changed during an UpdateHost call.
+// It is returned by value and computed inside the store's write lock.
+type HostChange struct {
+	IsNew      bool             // true if this IP was not previously in the store
+	MACChanged bool             // true if the MAC address changed (implies IsNew == false)
+	OldMAC     net.HardwareAddr // previous MAC (nil if IsNew or no change)
+	OldVendor  string           // previous vendor (empty if IsNew or no change)
+}
+
 // Store defines the interface for persisting and querying host inventory state.
 type Store interface {
-	// UpdateHost inserts or updates a host record.
-	UpdateHost(ctx context.Context, record HostRecord) error
+	// UpdateHost inserts or updates a host record and reports what changed.
+	UpdateHost(ctx context.Context, record HostRecord) (HostChange, error)
 
 	// GetHost retrieves a host record by IP address.
 	GetHost(ctx context.Context, ip netip.Addr) (*HostRecord, error)

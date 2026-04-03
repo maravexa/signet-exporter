@@ -3,10 +3,12 @@ package scanner
 import (
 	"context"
 	"log/slog"
+	"net"
 	"net/netip"
 	"sync"
 	"time"
 
+	"github.com/maravexa/signet-exporter/internal/audit"
 	"github.com/maravexa/signet-exporter/internal/oui"
 	"github.com/maravexa/signet-exporter/internal/state"
 )
@@ -22,6 +24,7 @@ type Scheduler struct {
 	scanners  []Scanner
 	store     state.Store
 	ouiDB     *oui.Database // may be nil when no OUI file is configured
+	auditLog  *audit.Logger // never nil after construction; disabled logger used as no-op
 	subnets   []SubnetConfig
 	semaphore chan struct{} // limits the number of concurrent subnet scans in flight
 	logger    *slog.Logger
@@ -33,6 +36,7 @@ type Scheduler struct {
 // maxParallel controls how many subnet scans may run concurrently; if <= 0, defaults to 1.
 // If scanners is empty, no scanning occurs but the scheduler is otherwise valid.
 // ouiDB may be nil; when nil, vendor enrichment is skipped silently.
+// auditLog may be nil; when nil, a no-op disabled logger is used.
 func NewScheduler(
 	scanners []Scanner,
 	store state.Store,
@@ -40,12 +44,16 @@ func NewScheduler(
 	maxParallel int,
 	logger *slog.Logger,
 	ouiDB *oui.Database,
+	auditLog *audit.Logger,
 ) *Scheduler {
 	if maxParallel <= 0 {
 		maxParallel = 1
 	}
 	if logger == nil {
 		logger = slog.Default()
+	}
+	if auditLog == nil {
+		auditLog = audit.Disabled()
 	}
 	if len(scanners) == 0 {
 		logger.Warn("scheduler: no scanners registered — no hosts will be discovered")
@@ -54,6 +62,7 @@ func NewScheduler(
 		scanners:  scanners,
 		store:     store,
 		ouiDB:     ouiDB,
+		auditLog:  auditLog,
 		subnets:   subnets,
 		semaphore: make(chan struct{}, maxParallel),
 		logger:    logger,
@@ -139,6 +148,11 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 		return
 	}
 
+	subnetStr := sc.Prefix.String()
+	cycleStart := time.Now()
+	var totalHosts int
+	scannersRun := make([]string, 0, len(s.scanners))
+
 	for _, scanner := range s.scanners {
 		if ctx.Err() != nil {
 			return
@@ -151,7 +165,7 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 		if err != nil {
 			s.logger.Warn("scan failed",
 				"scanner", scanner.Name(),
-				"subnet", sc.Prefix.String(),
+				"subnet", subnetStr,
 				"err", err,
 				"duration", duration,
 			)
@@ -164,6 +178,9 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 			})
 			continue
 		}
+
+		scannersRun = append(scannersRun, scanner.Name())
+		totalHosts += len(results)
 
 		for _, r := range results {
 			record := state.HostRecord{
@@ -178,11 +195,25 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 			if s.ouiDB != nil && len(r.MAC) >= 3 {
 				record.Vendor = s.ouiDB.Lookup(r.MAC)
 			}
-			if err := s.store.UpdateHost(ctx, record); err != nil {
+			change, err := s.store.UpdateHost(ctx, record)
+			if err != nil {
 				s.logger.Warn("failed to update host",
 					"ip", r.IP.String(),
 					"err", err,
 				)
+				continue
+			}
+
+			// Emit audit events based on what changed.
+			ip := net.ParseIP(r.IP.String())
+			if change.IsNew {
+				hostname := ""
+				if len(r.Hostnames) > 0 {
+					hostname = r.Hostnames[0]
+				}
+				s.auditLog.NewHost(ip, subnetStr, r.MAC, record.Vendor, hostname)
+			} else if change.MACChanged {
+				s.auditLog.MACIPChange(ip, subnetStr, change.OldMAC, r.MAC, change.OldVendor, record.Vendor)
 			}
 		}
 
@@ -196,9 +227,11 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 
 		s.logger.Info("scan complete",
 			"scanner", scanner.Name(),
-			"subnet", sc.Prefix.String(),
+			"subnet", subnetStr,
 			"hosts_found", len(results),
 			"duration", duration,
 		)
 	}
+
+	s.auditLog.ScanCycleComplete(subnetStr, totalHosts, time.Since(cycleStart), scannersRun)
 }

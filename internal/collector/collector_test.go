@@ -127,7 +127,7 @@ func TestCollect_HostUp(t *testing.T) {
 	}
 	for _, h := range hosts {
 		rec := makeHost(h.ip, h.mac, func(r *state.HostRecord) { r.Vendor = h.vendor })
-		if err := store.UpdateHost(ctx, rec); err != nil {
+		if _, err := store.UpdateHost(ctx, rec); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -167,7 +167,7 @@ func TestCollect_HostUp_Stale(t *testing.T) {
 	rec := makeHost("10.0.1.10", "aa:bb:cc:dd:ee:10", func(r *state.HostRecord) {
 		r.LastSeen = time.Now().Add(-10 * time.Minute) // older than 5m staleness threshold
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -194,7 +194,7 @@ func TestCollect_SubnetUtilization(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		ip := netip.AddrFrom4([4]byte{10, 0, 2, byte(i)}).String()
 		mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, byte(i)}.String()
-		if err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
+		if _, err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -238,7 +238,7 @@ func TestCollect_MultipleSubnets(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		ip := netip.AddrFrom4([4]byte{10, 1, 0, byte(i)}).String()
 		mac := net.HardwareAddr{0xaa, 0x01, 0x00, 0x00, 0x00, byte(i)}.String()
-		if err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
+		if _, err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -246,7 +246,7 @@ func TestCollect_MultipleSubnets(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		ip := netip.AddrFrom4([4]byte{10, 2, 0, byte(i)}).String()
 		mac := net.HardwareAddr{0xaa, 0x02, 0x00, 0x00, 0x00, byte(i)}.String()
-		if err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
+		if _, err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -301,10 +301,10 @@ func TestCollect_UnauthorizedDevice(t *testing.T) {
 	authorized := makeHost("10.0.3.2", "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
 		r.Authorized = true
 	})
-	if err := store.UpdateHost(ctx, unauthorized); err != nil {
+	if _, err := store.UpdateHost(ctx, unauthorized); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpdateHost(ctx, authorized); err != nil {
+	if _, err := store.UpdateHost(ctx, authorized); err != nil {
 		t.Fatal(err)
 	}
 
@@ -351,7 +351,7 @@ func TestCollect_PortOpen(t *testing.T) {
 	rec := makeHost("10.0.4.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.OpenPorts = []uint16{22, 443}
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -388,12 +388,12 @@ func TestCollect_MACBindingChanges(t *testing.T) {
 	ip := "10.0.5.1"
 
 	// Insert initial record
-	if err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:01")); err != nil {
+	if _, err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:01")); err != nil {
 		t.Fatal(err)
 	}
 
 	// First MAC change
-	if err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
+	if _, err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
 		r.LastSeen = time.Now().Add(time.Second)
 	})); err != nil {
 		t.Fatal(err)
@@ -415,7 +415,7 @@ func TestCollect_MACBindingChanges(t *testing.T) {
 	}
 
 	// Second MAC change
-	if err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:03", func(r *state.HostRecord) {
+	if _, err := store.UpdateHost(ctx, makeHost(ip, "aa:bb:cc:dd:ee:03", func(r *state.HostRecord) {
 		r.LastSeen = time.Now().Add(2 * time.Second)
 	})); err != nil {
 		t.Fatal(err)
@@ -539,7 +539,7 @@ func TestCollect_DNSMismatch(t *testing.T) {
 	rec := makeHost("10.0.8.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.DNSMismatches = []string{"bad.example.com"}
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -572,7 +572,7 @@ func TestCollect_DNSNoMismatch(t *testing.T) {
 	rec := makeHost("10.0.9.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.DNSMismatches = []string{}
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -597,7 +597,7 @@ func TestCollect_HostUp_HostnameLabel_Populated(t *testing.T) {
 	rec := makeHost("10.0.12.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.Hostnames = []string{"host1.example.com", "alias.example.com"}
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
@@ -627,7 +627,7 @@ func TestCollect_HostUp_HostnameLabel_Empty(t *testing.T) {
 	rec := makeHost("10.0.13.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.Hostnames = nil
 	})
-	if err := store.UpdateHost(ctx, rec); err != nil {
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
 		t.Fatal(err)
 	}
 
