@@ -69,7 +69,7 @@ The binary exits immediately if launched as UID 0. Use Linux capabilities or
 - `make setcap` builds and sets `CAP_NET_RAW` (requires sudo). Use for local testing.
 - `make install` installs to `/usr/local/bin/` with capabilities set.
 - The systemd unit uses `AmbientCapabilities=CAP_NET_RAW`.
-- Future `.deb` package uses `postinst` script to set capabilities after install/upgrade.
+- The `.deb`/`.rpm`/`.pkg.tar.zst` packages use `scripts/postinstall.sh` to set capabilities after install/upgrade.
 
 ### OUI Database
 
@@ -92,14 +92,28 @@ The binary exits immediately if launched as UID 0. Use Linux capabilities or
 | `/usr/lib/signet/update-oui.sh` | OUI update helper script | Package |
 | `/var/lib/signet/state.db` | bbolt persistent state (Phase 4) | Exporter runtime |
 
-### Future: `.deb` Packaging
+### Distribution Packages
 
-Not yet implemented. Planned for a future phase. When implemented:
-- Will add a `debian/` directory with control file, rules, and scripts.
-- `postinst` will call `setcap cap_net_raw+ep /usr/bin/signet-exporter`.
-- Package will ship `scripts/update-oui.sh` as `/usr/lib/signet/update-oui.sh`.
-- Package will bundle a snapshot of `data/oui.txt` as `/usr/share/signet/oui.txt`.
-- goreleaser `.goreleaser.yaml` will be updated to build `.deb` artifacts.
+- GoReleaser builds `.deb`, `.rpm`, and `.pkg.tar.zst` (Arch) packages via nFPM.
+- Package config is in `.goreleaser.yaml` under the `nfpms` section.
+- `scripts/postinstall.sh` runs after install/upgrade: sets CAP_NET_RAW, creates signet user, creates data directories.
+- `scripts/preremove.sh` runs before removal: stops and disables the systemd service.
+- Both scripts must be POSIX sh (not bash) and idempotent.
+- `/etc/signet/signet.yaml` is marked as a config file — package managers won't overwrite operator edits on upgrade.
+- The `.deb` dependency is `libcap2-bin` (provides setcap). The `.rpm` and Arch dependency is `libcap`.
+- `deploy/signet-exporter.sysusers` is a systemd-sysusers definition — declarative user creation as a backup to the postinstall script.
+- Packages are built only from the `standard` build (not FIPS). FIPS ships as a separate tarball.
+
+### Package File Manifest
+
+| Source | Package Destination | Notes |
+|---|---|---|
+| binary | `/usr/bin/signet-exporter` | goreleaser builds section |
+| `configs/signet.example.yaml` | `/etc/signet/signet.yaml` | conffile, preserved on upgrade |
+| `deploy/signet-exporter.service` | `/usr/lib/systemd/system/signet-exporter.service` | systemd unit |
+| `deploy/signet-exporter.sysusers` | `/usr/lib/sysusers.d/signet-exporter.conf` | declarative user creation |
+| `data/oui.txt` | `/usr/share/signet/oui.txt` | OUI database stub |
+| `scripts/update-oui.sh` | `/usr/lib/signet/update-oui.sh` | OUI update helper |
 
 ---
 

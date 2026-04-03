@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=simple
 User=signet
 Group=signet
-ExecStart=/usr/local/bin/signet-exporter --config=/etc/signet/signet.yaml
+ExecStart=/usr/bin/signet-exporter --config=/etc/signet/signet.yaml
 Restart=on-failure
 RestartSec=5s
 

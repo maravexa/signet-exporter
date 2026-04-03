@@ -33,6 +33,50 @@
 
 ---
 
+## Installation
+
+### Debian / Ubuntu (apt)
+
+    sudo dpkg -i signet-exporter_<version>_linux_amd64.deb
+
+Or from a hosted apt repository (if configured):
+
+    sudo apt install signet-exporter
+
+### RHEL / Fedora / SUSE (yum / dnf / zypper)
+
+    sudo rpm -i signet-exporter_<version>_linux_amd64.rpm
+
+Or:
+
+    sudo dnf install signet-exporter_<version>_linux_amd64.rpm
+
+### Arch Linux (pacman)
+
+    sudo pacman -U signet-exporter_<version>_linux_amd64.pkg.tar.zst
+
+### From Source
+
+    git clone https://github.com/maravexa/signet-exporter.git
+    cd signet-exporter
+    make install-all
+
+### Post-Install
+
+All packages automatically:
+- Create a `signet` system user
+- Set `CAP_NET_RAW` on the binary
+- Install a default config at `/etc/signet/signet.yaml`
+- Install the systemd unit
+
+Enable and start the service:
+
+    sudo systemctl enable --now signet-exporter
+
+Edit `/etc/signet/signet.yaml` to add your subnets before starting.
+
+---
+
 ## Quickstart
 
 ### Build

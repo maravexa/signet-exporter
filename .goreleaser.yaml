@@ -79,6 +79,89 @@ release:
   draft: false
   prerelease: auto
 
+nfpms:
+  - id: signet-exporter
+    package_name: signet-exporter
+    builds: [standard]
+    vendor: Mara Vexa
+    homepage: https://github.com/maravexa/signet-exporter
+    maintainer: Mara Vexa <mara@maravexa.com>
+    description: >-
+      Prometheus exporter for network inventory observability. Subnet scanning,
+      ARP-based duplicate detection, MAC-IP binding stability, DNS consistency,
+      and rogue device detection. Designed for air-gapped and compliance-heavy
+      environments.
+    license: MIT
+    section: net
+    priority: optional
+
+    formats:
+      - deb
+      - rpm
+      - archlinux
+
+    # Package dependencies — deb default; overridden per-format below
+    dependencies:
+      - libcap2-bin   # provides setcap, needed by postinstall
+
+    overrides:
+      rpm:
+        group: Monitoring
+        dependencies:
+          - libcap
+      archlinux:
+        dependencies:
+          - libcap
+
+    # Files to include in the package beyond the binary
+    contents:
+      # Default config file — marked as conffile so package managers preserve operator edits on upgrade
+      - src: configs/signet.example.yaml
+        dst: /etc/signet/signet.yaml
+        type: config
+        file_info:
+          mode: 0640
+          owner: root
+          group: signet
+
+      # systemd unit
+      - src: deploy/signet-exporter.service
+        dst: /usr/lib/systemd/system/signet-exporter.service
+        file_info:
+          mode: 0644
+
+      # sysusers.d — declarative user creation
+      - src: deploy/signet-exporter.sysusers
+        dst: /usr/lib/sysusers.d/signet-exporter.conf
+        file_info:
+          mode: 0644
+
+      # OUI database stub (operator should run update-oui.sh for full database)
+      - src: data/oui.txt
+        dst: /usr/share/signet/oui.txt
+        file_info:
+          mode: 0644
+          owner: signet
+          group: signet
+
+      # OUI update helper script
+      - src: scripts/update-oui.sh
+        dst: /usr/lib/signet/update-oui.sh
+        file_info:
+          mode: 0755
+
+      # State directory
+      - dst: /var/lib/signet
+        type: dir
+        file_info:
+          mode: 0750
+          owner: signet
+          group: signet
+
+    scripts:
+      postinstall: scripts/postinstall.sh
+      preremove: scripts/preremove.sh
+
 changelog:
   sort: asc
   filters:
