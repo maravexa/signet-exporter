@@ -54,7 +54,7 @@ func NewSignetCollector(store state.Store, subnets []netip.Prefix, logger *slog.
 		hostUp: prometheus.NewDesc(
 			"signet_host_up",
 			"1 if the host responded during the most recent scan, 0 otherwise.",
-			[]string{"ip", "mac", "vendor", "subnet"}, nil,
+			[]string{"ip", "mac", "vendor", "hostname", "subnet"}, nil,
 		),
 		scanDuration: prometheus.NewDesc(
 			"signet_scan_duration_seconds",
@@ -185,11 +185,15 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 			if now.Sub(host.LastSeen) > stalenessThreshold {
 				upVal = 0.0
 			}
+			hostname := ""
+			if len(host.Hostnames) > 0 {
+				hostname = host.Hostnames[0]
+			}
 			ch <- prometheus.MustNewConstMetric(
 				c.hostUp,
 				prometheus.GaugeValue,
 				upVal,
-				ipStr, macStr, vendor, subnetStr,
+				ipStr, macStr, vendor, hostname, subnetStr,
 			)
 
 			// signet_unauthorized_device_detected.

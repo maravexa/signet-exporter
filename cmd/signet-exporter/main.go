@@ -15,6 +15,7 @@ import (
 
 	"github.com/maravexa/signet-exporter/internal/collector"
 	"github.com/maravexa/signet-exporter/internal/config"
+	"github.com/maravexa/signet-exporter/internal/oui"
 	"github.com/maravexa/signet-exporter/internal/scanner"
 	"github.com/maravexa/signet-exporter/internal/server"
 	"github.com/maravexa/signet-exporter/internal/state"
@@ -114,8 +115,24 @@ func main() {
 		scanner.NewPortScanner(store, subnetPorts, nil, cfg.Scanner.PortTimeout, cfg.Scanner.PortMaxWorkers, logger),
 	}
 
+	// Load OUI vendor database if configured; failure is non-fatal (degraded mode).
+	var ouiDB *oui.Database
+	if cfg.OUIDatabase != "" {
+		var ouiErr error
+		ouiDB, ouiErr = oui.LoadDatabase(cfg.OUIDatabase)
+		if ouiErr != nil {
+			logger.Warn("OUI database unavailable — vendor labels will be empty",
+				"path", cfg.OUIDatabase,
+				"err", ouiErr,
+			)
+			ouiDB = nil
+		} else {
+			logger.Info("OUI database loaded", "path", cfg.OUIDatabase, "entries", ouiDB.Len())
+		}
+	}
+
 	signetCollector := collector.NewSignetCollector(store, prefixes, logger)
-	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger)
+	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger, ouiDB)
 
 	if cfg.TLS.CertFile == "" {
 		logger.Warn("TLS not configured — serving metrics over plaintext HTTP; not recommended for production")

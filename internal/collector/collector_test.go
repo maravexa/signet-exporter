@@ -589,6 +589,65 @@ func TestCollect_DNSNoMismatch(t *testing.T) {
 	}
 }
 
+func TestCollect_HostUp_HostnameLabel_Populated(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.12.0/24"
+
+	rec := makeHost("10.0.12.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.Hostnames = []string{"host1.example.com", "alias.example.com"}
+	})
+	if err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_host_up")
+	if fam == nil {
+		t.Fatal("signet_host_up not emitted")
+	}
+	s := findSample(fam, map[string]string{
+		"ip":       "10.0.12.1",
+		"hostname": "host1.example.com",
+		"subnet":   subnet,
+	})
+	if s == nil {
+		t.Error("no host_up sample with first hostname label")
+	}
+}
+
+func TestCollect_HostUp_HostnameLabel_Empty(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.13.0/24"
+
+	// Host with no hostnames: label should be empty string.
+	rec := makeHost("10.0.13.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.Hostnames = nil
+	})
+	if err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_host_up")
+	if fam == nil {
+		t.Fatal("signet_host_up not emitted")
+	}
+	s := findSample(fam, map[string]string{
+		"ip":       "10.0.13.1",
+		"hostname": "",
+		"subnet":   subnet,
+	})
+	if s == nil {
+		t.Error("no host_up sample with empty hostname label for host with no hostnames")
+	}
+}
+
 func TestCollect_NoScanMeta_NoEmission(t *testing.T) {
 	store := state.NewMemoryStore()
 	subnet := "10.0.7.0/24"

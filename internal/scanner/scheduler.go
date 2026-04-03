@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/maravexa/signet-exporter/internal/oui"
 	"github.com/maravexa/signet-exporter/internal/state"
 )
 
@@ -20,6 +21,7 @@ type SubnetConfig struct {
 type Scheduler struct {
 	scanners  []Scanner
 	store     state.Store
+	ouiDB     *oui.Database // may be nil when no OUI file is configured
 	subnets   []SubnetConfig
 	semaphore chan struct{} // limits the number of concurrent subnet scans in flight
 	logger    *slog.Logger
@@ -30,12 +32,14 @@ type Scheduler struct {
 // NewScheduler creates a Scheduler.
 // maxParallel controls how many subnet scans may run concurrently; if <= 0, defaults to 1.
 // If scanners is empty, no scanning occurs but the scheduler is otherwise valid.
+// ouiDB may be nil; when nil, vendor enrichment is skipped silently.
 func NewScheduler(
 	scanners []Scanner,
 	store state.Store,
 	subnets []SubnetConfig,
 	maxParallel int,
 	logger *slog.Logger,
+	ouiDB *oui.Database,
 ) *Scheduler {
 	if maxParallel <= 0 {
 		maxParallel = 1
@@ -49,6 +53,7 @@ func NewScheduler(
 	return &Scheduler{
 		scanners:  scanners,
 		store:     store,
+		ouiDB:     ouiDB,
 		subnets:   subnets,
 		semaphore: make(chan struct{}, maxParallel),
 		logger:    logger,
@@ -169,6 +174,9 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 				Hostnames:     r.Hostnames,
 				DNSMismatches: r.DNSMismatches,
 				OpenPorts:     r.OpenPorts,
+			}
+			if s.ouiDB != nil && len(r.MAC) >= 3 {
+				record.Vendor = s.ouiDB.Lookup(r.MAC)
 			}
 			if err := s.store.UpdateHost(ctx, record); err != nil {
 				s.logger.Warn("failed to update host",
