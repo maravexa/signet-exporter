@@ -1,3 +1,5 @@
+//go:build !boringcrypto
+
 package fips
 
 import "testing"

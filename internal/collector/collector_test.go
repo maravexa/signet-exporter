@@ -10,6 +10,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/maravexa/signet-exporter/internal/fips"
 	"github.com/maravexa/signet-exporter/internal/state"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -737,10 +738,13 @@ func TestCollect_FIPSEnabled(t *testing.T) {
 	if len(fam.GetMetric()) != 1 {
 		t.Fatalf("expected 1 sample, got %d", len(fam.GetMetric()))
 	}
-	// In a normal (non-boringcrypto) test build, FIPS must be disabled.
 	val := fam.GetMetric()[0].GetGauge().GetValue()
-	if val != 0.0 {
-		t.Errorf("signet_exporter_fips_enabled = %v in non-boringcrypto build, want 0", val)
+	wantVal := 0.0
+	if fips.Enabled() {
+		wantVal = 1.0
+	}
+	if val != wantVal {
+		t.Errorf("signet_exporter_fips_enabled = %v, want %v (fips.Enabled=%v)", val, wantVal, fips.Enabled())
 	}
 }
 
