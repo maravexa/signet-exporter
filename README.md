@@ -298,3 +298,18 @@ Apache License 2.0 — see [LICENSE](LICENSE).
     static_configs:
       - targets: ["127.0.0.1:9420"]
 ```
+
+---
+
+## Grafana Dashboard
+
+A pre-built Grafana dashboard is included in [`grafana/signet-overview.json`](grafana/signet-overview.json).
+
+See [`grafana/README.md`](grafana/README.md) for import instructions (UI upload or provisioning) and full details.
+
+The dashboard covers:
+
+- **Host Inventory** — live host counts and MAC-IP binding table
+- **Scan Performance** — ARP, ICMP, DNS, and port scan durations
+- **Subnet Utilization** — address space usage per subnet
+- **Security Alerts** — unauthorized devices, duplicate IPs, and DNS mismatches
