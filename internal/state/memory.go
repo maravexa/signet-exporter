@@ -147,7 +147,10 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) (HostChan
 			copy(existing.OpenPorts, record.OpenPorts)
 		}
 		existing.Vendor = record.Vendor
-		existing.Authorized = record.Authorized
+		if record.AuthorizationChecked {
+			existing.AuthorizationChecked = true
+			existing.Authorized = record.Authorized
+		}
 		existing.Alive = record.Alive
 		return HostChange{}, nil
 	}
@@ -193,7 +196,10 @@ func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) (HostChan
 		copy(existing.OpenPorts, record.OpenPorts)
 	}
 	existing.Vendor = record.Vendor
-	existing.Authorized = record.Authorized
+	if record.AuthorizationChecked {
+		existing.AuthorizationChecked = true
+		existing.Authorized = record.Authorized
+	}
 	existing.Alive = record.Alive
 	existing.MACChangeCount++
 

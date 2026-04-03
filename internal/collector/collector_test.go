@@ -295,17 +295,23 @@ func TestCollect_UnauthorizedDevice(t *testing.T) {
 	store := state.NewMemoryStore()
 	subnet := "10.0.3.0/24"
 
-	unauthorized := makeHost("10.0.3.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+	// Checked + unauthorized: must emit metric with value 1.
+	rogue := makeHost("10.0.3.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.Authorized = false
+		r.AuthorizationChecked = true
 	})
-	authorized := makeHost("10.0.3.2", "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
+	// Checked + authorized: must NOT emit metric.
+	legit := makeHost("10.0.3.2", "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
 		r.Authorized = true
+		r.AuthorizationChecked = true
 	})
-	if _, err := store.UpdateHost(ctx, unauthorized); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.UpdateHost(ctx, authorized); err != nil {
-		t.Fatal(err)
+	// Unchecked (no allowlist configured): must NOT emit metric.
+	unchecked := makeHost("10.0.3.3", "aa:bb:cc:dd:ee:03")
+
+	for _, rec := range []state.HostRecord{rogue, legit, unchecked} {
+		if _, err := store.UpdateHost(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	c := newTestCollector(store, subnet)
@@ -313,7 +319,10 @@ func TestCollect_UnauthorizedDevice(t *testing.T) {
 
 	fam := findMetric(families, "signet_unauthorized_device_detected")
 	if fam == nil {
-		t.Fatal("signet_unauthorized_device_detected not emitted")
+		t.Fatal("signet_unauthorized_device_detected not emitted at all")
+	}
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("expected exactly 1 sample (rogue only), got %d", len(fam.GetMetric()))
 	}
 
 	unauthSample := findSample(fam, map[string]string{
@@ -323,23 +332,22 @@ func TestCollect_UnauthorizedDevice(t *testing.T) {
 		"subnet": subnet,
 	})
 	if unauthSample == nil {
-		t.Fatal("no sample for unauthorized host")
+		t.Fatal("no sample for rogue host")
 	}
 	if unauthSample.GetGauge().GetValue() != 1.0 {
-		t.Errorf("unauthorized host value = %v, want 1", unauthSample.GetGauge().GetValue())
+		t.Errorf("rogue host value = %v, want 1", unauthSample.GetGauge().GetValue())
 	}
 
-	authSample := findSample(fam, map[string]string{
-		"ip":     "10.0.3.2",
-		"mac":    "aa:bb:cc:dd:ee:02",
-		"vendor": "TestVendor",
-		"subnet": subnet,
-	})
-	if authSample == nil {
-		t.Fatal("no sample for authorized host")
+	// Authorized+checked host must not appear.
+	legitSample := findSample(fam, map[string]string{"ip": "10.0.3.2"})
+	if legitSample != nil {
+		t.Error("authorized host should not appear in signet_unauthorized_device_detected")
 	}
-	if authSample.GetGauge().GetValue() != 0.0 {
-		t.Errorf("authorized host value = %v, want 0", authSample.GetGauge().GetValue())
+
+	// Unchecked host must not appear.
+	uncheckedSample := findSample(fam, map[string]string{"ip": "10.0.3.3"})
+	if uncheckedSample != nil {
+		t.Error("unchecked host should not appear in signet_unauthorized_device_detected")
 	}
 }
 

@@ -21,15 +21,16 @@ type SubnetConfig struct {
 
 // Scheduler drives periodic subnet scans with a configurable concurrency limit.
 type Scheduler struct {
-	scanners  []Scanner
-	store     state.Store
-	ouiDB     *oui.Database // may be nil when no OUI file is configured
-	auditLog  *audit.Logger // never nil after construction; disabled logger used as no-op
-	subnets   []SubnetConfig
-	semaphore chan struct{} // limits the number of concurrent subnet scans in flight
-	logger    *slog.Logger
-	readyCh   chan struct{} // closed after every configured subnet completes its first scan
-	readyOnce sync.Once
+	scanners   []Scanner
+	store      state.Store
+	ouiDB      *oui.Database         // may be nil when no OUI file is configured
+	auditLog   *audit.Logger         // never nil after construction; disabled logger used as no-op
+	allowlists map[string]*Allowlist // key: subnet prefix string; nil map = no allowlists configured
+	subnets    []SubnetConfig
+	semaphore  chan struct{} // limits the number of concurrent subnet scans in flight
+	logger     *slog.Logger
+	readyCh    chan struct{} // closed after every configured subnet completes its first scan
+	readyOnce  sync.Once
 }
 
 // NewScheduler creates a Scheduler.
@@ -37,6 +38,7 @@ type Scheduler struct {
 // If scanners is empty, no scanning occurs but the scheduler is otherwise valid.
 // ouiDB may be nil; when nil, vendor enrichment is skipped silently.
 // auditLog may be nil; when nil, a no-op disabled logger is used.
+// allowlists may be nil; when nil, no authorization checks are performed.
 func NewScheduler(
 	scanners []Scanner,
 	store state.Store,
@@ -45,6 +47,7 @@ func NewScheduler(
 	logger *slog.Logger,
 	ouiDB *oui.Database,
 	auditLog *audit.Logger,
+	allowlists map[string]*Allowlist,
 ) *Scheduler {
 	if maxParallel <= 0 {
 		maxParallel = 1
@@ -59,14 +62,15 @@ func NewScheduler(
 		logger.Warn("scheduler: no scanners registered — no hosts will be discovered")
 	}
 	return &Scheduler{
-		scanners:  scanners,
-		store:     store,
-		ouiDB:     ouiDB,
-		auditLog:  auditLog,
-		subnets:   subnets,
-		semaphore: make(chan struct{}, maxParallel),
-		logger:    logger,
-		readyCh:   make(chan struct{}),
+		scanners:   scanners,
+		store:      store,
+		ouiDB:      ouiDB,
+		auditLog:   auditLog,
+		allowlists: allowlists,
+		subnets:    subnets,
+		semaphore:  make(chan struct{}, maxParallel),
+		logger:     logger,
+		readyCh:    make(chan struct{}),
 	}
 }
 
@@ -234,4 +238,36 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 	}
 
 	s.auditLog.ScanCycleComplete(subnetStr, totalHosts, time.Since(cycleStart), scannersRun)
+
+	// Authorization check: run after all scanners so every discovered host is present.
+	if al, ok := s.allowlists[subnetStr]; ok && al != nil {
+		s.checkAuthorization(ctx, sc, al)
+	}
+}
+
+// checkAuthorization checks each known host in the subnet against the MAC allowlist,
+// updates authorization state in the store, and emits audit events for rogue devices.
+func (s *Scheduler) checkAuthorization(ctx context.Context, sc SubnetConfig, al *Allowlist) {
+	hosts, err := s.store.ListHosts(ctx, sc.Prefix)
+	if err != nil {
+		s.logger.Warn("checkAuthorization: ListHosts failed", "subnet", sc.Prefix, "err", err)
+		return
+	}
+	subnetStr := sc.Prefix.String()
+	for _, host := range hosts {
+		if len(host.MAC) == 0 {
+			continue
+		}
+		authorized := al.Contains(host.MAC)
+		host.AuthorizationChecked = true
+		host.Authorized = authorized
+		if _, err := s.store.UpdateHost(ctx, host); err != nil {
+			s.logger.Warn("checkAuthorization: UpdateHost failed", "ip", host.IP, "err", err)
+			continue
+		}
+		if !authorized {
+			ip := net.ParseIP(host.IP.String())
+			s.auditLog.UnauthorizedDevice(ip, subnetStr, host.MAC, host.Vendor)
+		}
+	}
 }

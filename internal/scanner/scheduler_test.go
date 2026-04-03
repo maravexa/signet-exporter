@@ -113,7 +113,7 @@ func TestScheduler_ImmediateFirstScan(t *testing.T) {
 		},
 	}
 
-	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil)
+	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -143,7 +143,7 @@ func TestScheduler_PeriodicScans(t *testing.T) {
 	subnet := makeSubnetConfig("10.2.0.0/24", 80*time.Millisecond)
 
 	mock := &mockScanner{name: "arp"}
-	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil)
+	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -175,7 +175,7 @@ func TestScheduler_ConcurrencyLimit(t *testing.T) {
 	}
 
 	tracker := &concurrencyTrackingScanner{delay: delay}
-	sched := NewScheduler([]Scanner{tracker}, store, subnets, maxParallel, nil, nil, nil)
+	sched := NewScheduler([]Scanner{tracker}, store, subnets, maxParallel, nil, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -199,7 +199,7 @@ func TestScheduler_ScanError_Continues(t *testing.T) {
 	subnet := makeSubnetConfig("10.4.0.0/24", 60*time.Millisecond)
 
 	mock := &mockScanner{name: "arp", err: errFakeScanError}
-	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil)
+	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil, nil)
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -240,7 +240,7 @@ func TestScheduler_ContextCancellation(t *testing.T) {
 	subnet := makeSubnetConfig("10.5.0.0/24", time.Hour)
 	mock := &mockScanner{name: "arp", delay: 10 * time.Millisecond}
 
-	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil)
+	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan struct{})
@@ -273,7 +273,7 @@ func TestScheduler_ReadyAfterAllSubnets(t *testing.T) {
 
 	mock := &mockScanner{name: "arp", delay: scanDelay}
 	// maxParallel=3 so all subnets start simultaneously.
-	sched := NewScheduler([]Scanner{mock}, store, subnets, 3, nil, nil, nil)
+	sched := NewScheduler([]Scanner{mock}, store, subnets, 3, nil, nil, nil, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -308,7 +308,7 @@ func TestScheduler_WritesToStore(t *testing.T) {
 		makeScanResult("10.7.0.3", "aa:00:00:00:00:03"),
 	}
 	mock := &mockScanner{name: "arp", results: results}
-	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil)
+	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 2, nil, nil, nil, nil)
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -351,7 +351,7 @@ func TestScheduler_MultipleScannersPerSubnet(t *testing.T) {
 
 	arp := &mockScanner{name: "arp"}
 	icmp := &mockScanner{name: "icmp"}
-	sched := NewScheduler([]Scanner{arp, icmp}, store, []SubnetConfig{subnet}, 2, nil, nil, nil)
+	sched := NewScheduler([]Scanner{arp, icmp}, store, []SubnetConfig{subnet}, 2, nil, nil, nil, nil)
 
 	runCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()

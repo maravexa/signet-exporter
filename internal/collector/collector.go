@@ -196,17 +196,16 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 				ipStr, macStr, vendor, hostname, subnetStr,
 			)
 
-			// signet_unauthorized_device_detected.
-			authorizedVal := 0.0
-			if !host.Authorized {
-				authorizedVal = 1.0
+			// signet_unauthorized_device_detected: only emitted for hosts whose
+			// allowlist check has been applied and whose MAC is not authorized.
+			if host.AuthorizationChecked && !host.Authorized {
+				ch <- prometheus.MustNewConstMetric(
+					c.unauthorizedDevice,
+					prometheus.GaugeValue,
+					1,
+					ipStr, macStr, vendor, subnetStr,
+				)
 			}
-			ch <- prometheus.MustNewConstMetric(
-				c.unauthorizedDevice,
-				prometheus.GaugeValue,
-				authorizedVal,
-				ipStr, macStr, vendor, subnetStr,
-			)
 
 			// signet_port_open: one metric per open port.
 			for _, port := range host.OpenPorts {

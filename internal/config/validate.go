@@ -98,5 +98,10 @@ func validateSubnet(s *SubnetConfig) error {
 	if s.ScanInterval <= 0 {
 		return fmt.Errorf("scan_interval must be > 0")
 	}
+	if s.MACAllowlistFile != "" {
+		if _, err := os.Stat(s.MACAllowlistFile); os.IsNotExist(err) {
+			return fmt.Errorf("mac_allowlist_file %q does not exist", s.MACAllowlistFile)
+		}
+	}
 	return nil
 }
