@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/maravexa/signet-exporter/internal/fips"
 	"github.com/maravexa/signet-exporter/internal/state"
 	"github.com/maravexa/signet-exporter/internal/version"
 	"github.com/maravexa/signet-exporter/pkg/netutil"
@@ -39,6 +40,7 @@ type SignetCollector struct {
 	portOpen                  *prometheus.Desc
 	scanErrors                *prometheus.Desc
 	buildInfo                 *prometheus.Desc
+	fipsEnabled               *prometheus.Desc
 }
 
 // NewSignetCollector creates a collector wired to the given state store, subnet list, and logger.
@@ -112,6 +114,11 @@ func NewSignetCollector(store state.Store, subnets []netip.Prefix, logger *slog.
 			"Always 1. Carries build metadata as labels.",
 			[]string{"version", "commit", "goversion"}, nil,
 		),
+		fipsEnabled: prometheus.NewDesc(
+			"signet_exporter_fips_enabled",
+			"1 if the binary was compiled with BoringCrypto (GOEXPERIMENT=boringcrypto), 0 otherwise.",
+			nil, nil,
+		),
 	}
 }
 
@@ -129,6 +136,7 @@ func (c *SignetCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.portOpen
 	ch <- c.scanErrors
 	ch <- c.buildInfo
+	ch <- c.fipsEnabled
 }
 
 // Collect reads the current state and emits metrics. Called on every Prometheus scrape.
@@ -145,6 +153,12 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 		1,
 		version.Version, version.Commit, runtime.Version(),
 	)
+
+	fipsVal := 0.0
+	if fips.Enabled() {
+		fipsVal = 1.0
+	}
+	ch <- prometheus.MustNewConstMetric(c.fipsEnabled, prometheus.GaugeValue, fipsVal)
 
 	now := time.Now()
 

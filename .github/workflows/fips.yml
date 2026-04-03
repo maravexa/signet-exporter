@@ -1,0 +1,44 @@
+name: FIPS Validation
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  fips-validate:
+    name: FIPS Build Validation
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build FIPS binary
+        env:
+          GOEXPERIMENT: boringcrypto
+          CGO_ENABLED: "1"
+        run: go build -o signet-exporter-fips ./cmd/signet-exporter/
+
+      - name: Verify BoringCrypto symbols
+        run: |
+          go tool nm signet-exporter-fips | grep -q '_Cfunc__goboringcrypto_' || \
+            (echo "ERROR: BoringCrypto symbols not found in FIPS binary" && exit 1)
+
+      - name: Run tests with BoringCrypto
+        env:
+          GOEXPERIMENT: boringcrypto
+          CGO_ENABLED: "1"
+        run: go test ./... -race -count=1
+
+      - name: Verify FIPS detection
+        run: |
+          ./signet-exporter-fips --version | grep -q "fips=true" || \
+            (echo "ERROR: FIPS binary does not report fips=true" && exit 1)

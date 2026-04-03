@@ -286,3 +286,161 @@ Kubernetes deployment manifests are planned for a future release. The exporter r
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
+
+---
+
+## Prometheus Scrape Config
+
+```yaml
+- job_name: "signet"
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    static_configs:
+      - targets: ["127.0.0.1:9420"]
+```
+
+---
+
+## mTLS
+
+Signet supports mutual TLS (mTLS) so that only authenticated Prometheus scrapers can reach `/metrics`. This satisfies SC-8 (Transmission Confidentiality and Integrity) in NIST 800-53 / FedRAMP environments.
+
+### Dev quickstart — generate a cert chain
+
+```bash
+signet-exporter --generate-certs /etc/signet/tls
+```
+
+This creates a self-signed CA, a server cert (SAN: `localhost`, `127.0.0.1`, `::1`), and a client cert — all ECDSA P-256:
+
+```
+/etc/signet/tls/
+  ca.pem            ca-key.pem
+  server.pem        server-key.pem
+  client.pem        client-key.pem
+```
+
+### Enable mTLS in signet.yaml
+
+```yaml
+tls:
+  cert_file: "/etc/signet/tls/server.pem"
+  key_file:  "/etc/signet/tls/server-key.pem"
+  client_ca_file:     "/etc/signet/tls/ca.pem"
+  client_auth_policy: "require_and_verify"   # default when client_ca_file is set
+```
+
+`client_auth_policy` values:
+
+| Value | Behaviour |
+|---|---|
+| `require_and_verify` | Client cert is mandatory and must be CA-signed *(default)* |
+| `verify_if_given` | Verify if presented, but don't require one |
+| `no_client_cert` | Don't request a client cert |
+
+### Configure Prometheus to present the client cert
+
+```yaml
+scrape_configs:
+  - job_name: "signet"
+    scheme: https
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    tls_config:
+      ca_file:   "/etc/signet/tls/ca.pem"
+      cert_file: "/etc/signet/tls/client.pem"
+      key_file:  "/etc/signet/tls/client-key.pem"
+    static_configs:
+      - targets: ["127.0.0.1:9420"]
+```
+
+### Certificate rotation (zero downtime)
+
+Send `SIGHUP` to reload the server cert and key from disk without restarting:
+
+```bash
+# systemd
+systemctl reload signet-exporter
+
+# manual
+kill -HUP $(pidof signet-exporter)
+```
+
+If the new files are invalid, the old certificate remains active and an error is logged. No connections are dropped.
+
+---
+
+## Grafana Dashboard
+
+A pre-built Grafana dashboard is included in [`grafana/signet-overview.json`](grafana/signet-overview.json).
+
+See [`grafana/README.md`](grafana/README.md) for import instructions (UI upload or provisioning) and full details.
+
+The dashboard covers:
+
+- **Host Inventory** — live host counts and MAC-IP binding table
+- **Scan Performance** — ARP, ICMP, DNS, and port scan durations
+- **Subnet Utilization** — address space usage per subnet
+- **Security Alerts** — unauthorized devices, duplicate IPs, and DNS mismatches
+
+
+---
+
+## Audit Logging
+
+signet-exporter emits structured audit records for security-relevant events (new hosts, MAC changes, unauthorized devices, scan errors, and TLS certificate reloads).
+
+Records can be written in **JSON** (default, one object per line) or **CEF** (Common Event Format) for SIEM integration with Splunk, QRadar, ArcSight, and similar platforms.
+
+```yaml
+audit:
+  enabled: true
+  format: "json"    # or "cef"
+  output: "file"
+  path: "/var/log/signet/audit.log"
+```
+
+See [`docs/audit-logging.md`](docs/audit-logging.md) for the full event reference, log rotation guidance, and SIEM integration examples.
+
+---
+
+## Config Hot-Reload (SIGHUP)
+
+Send `SIGHUP` to apply configuration changes without restarting or losing scan state:
+
+```bash
+# systemd
+systemctl reload signet-exporter
+
+# manual
+kill -HUP $(pidof signet-exporter)
+```
+
+### What is reloadable
+
+| Setting | Reloadable? |
+|---------|-------------|
+| `subnets` — CIDR list, scan intervals | Yes — SIGHUP |
+| `subnets` — TCP ports per subnet | Yes — SIGHUP |
+| `subnets` — MAC allowlist file paths | Yes — SIGHUP |
+| TLS certificate contents | Yes — SIGHUP (cert rotation) |
+| `listen_address` | **No** — restart required |
+| `tls.*` (paths, min_version) | **No** — restart required |
+| `state.*` (backend, bolt path) | **No** — restart required |
+| `dns.*`, `scanner.*`, `oui_database` | **No** — restart required |
+| `audit.*` | **No** — restart required |
+
+### What happens on reload
+
+1. The config file is re-read from the same path used at startup.
+2. The reloadable subset is validated. **If validation fails, the old config stays active** — the exporter continues running unchanged and logs the error.
+3. If validation passes, changes are diffed and applied atomically:
+   - New subnets begin scanning immediately.
+   - Removed subnets exit after their current scan cycle completes.
+   - Interval, port, and allowlist changes take effect on the next scan cycle.
+4. TLS certificates are reloaded from disk (same paths as startup).
+5. All changes are logged in the audit trail with a `config_reloaded` event containing a human-readable diff.
+
+### Invalid config handling
+
+If the reloaded config contains an invalid CIDR, out-of-range port, or a missing allowlist file, the reload is rejected entirely — no partial changes are applied. The error is logged at ERROR level and the exporter continues with the previous configuration.

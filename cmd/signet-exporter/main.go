@@ -16,24 +16,67 @@ import (
 	"github.com/maravexa/signet-exporter/internal/audit"
 	"github.com/maravexa/signet-exporter/internal/collector"
 	"github.com/maravexa/signet-exporter/internal/config"
+	"github.com/maravexa/signet-exporter/internal/fips"
 	"github.com/maravexa/signet-exporter/internal/oui"
 	"github.com/maravexa/signet-exporter/internal/scanner"
 	"github.com/maravexa/signet-exporter/internal/server"
 	"github.com/maravexa/signet-exporter/internal/state"
+	"github.com/maravexa/signet-exporter/internal/tlsutil"
 	"github.com/maravexa/signet-exporter/internal/version"
 )
 
 func main() {
 	var (
-		configPath   = flag.String("config", "/etc/signet/signet.yaml", "path to configuration file")
-		validateOnly = flag.Bool("validate", false, "validate configuration and exit")
-		showVersion  = flag.Bool("version", false, "print version information and exit")
+		configPath    = flag.String("config", "/etc/signet/signet.yaml", "path to configuration file")
+		validateOnly  = flag.Bool("validate", false, "validate configuration and exit")
+		showVersion   = flag.Bool("version", false, "print version information and exit")
+		generateCerts = flag.String("generate-certs", "", "generate a dev CA + server + client cert chain in the given directory and exit")
+		compactDB     = flag.String("compact-db", "", "compact the bbolt state database at the given path and exit (exporter must not be running)")
 	)
 	flag.Parse()
 
 	if *showVersion {
-		fmt.Printf("signet-exporter %s (commit: %s, built: %s)\n",
-			version.Version, version.Commit, version.Date)
+		fmt.Printf("signet-exporter %s (commit: %s, built: %s, fips=%v)\n",
+			version.Version, version.Commit, version.Date, fips.Enabled())
+		os.Exit(0)
+	}
+
+	if *compactDB != "" {
+		if err := CompactDB(*compactDB); err != nil {
+			fmt.Fprintf(os.Stderr, "error: compact-db: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+
+	if *generateCerts != "" {
+		if err := tlsutil.GenerateCerts(*generateCerts); err != nil {
+			fmt.Fprintf(os.Stderr, "error: generate-certs: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Generated TLS certificates in %s/\n\n", *generateCerts)
+		fmt.Printf("  CA cert:        %s/ca.pem\n", *generateCerts)
+		fmt.Printf("  CA key:         %s/ca-key.pem\n", *generateCerts)
+		fmt.Printf("  Server cert:    %s/server.pem\n", *generateCerts)
+		fmt.Printf("  Server key:     %s/server-key.pem\n", *generateCerts)
+		fmt.Printf("  Client cert:    %s/client.pem\n", *generateCerts)
+		fmt.Printf("  Client key:     %s/client-key.pem\n\n", *generateCerts)
+		fmt.Printf("Add the following to your signet.yaml to enable mTLS:\n\n")
+		fmt.Printf("  tls:\n")
+		fmt.Printf("    cert_file: \"%s/server.pem\"\n", *generateCerts)
+		fmt.Printf("    key_file: \"%s/server-key.pem\"\n", *generateCerts)
+		fmt.Printf("    client_ca_file: \"%s/ca.pem\"\n", *generateCerts)
+		fmt.Printf("    client_auth_policy: \"require_and_verify\"\n\n")
+		fmt.Printf("Configure Prometheus to present the client cert when scraping:\n\n")
+		fmt.Printf("  scrape_configs:\n")
+		fmt.Printf("    - job_name: \"signet\"\n")
+		fmt.Printf("      scheme: https\n")
+		fmt.Printf("      tls_config:\n")
+		fmt.Printf("        ca_file: \"%s/ca.pem\"\n", *generateCerts)
+		fmt.Printf("        cert_file: \"%s/client.pem\"\n", *generateCerts)
+		fmt.Printf("        key_file: \"%s/client-key.pem\"\n", *generateCerts)
+		fmt.Printf("      static_configs:\n")
+		fmt.Printf("        - targets: [\"127.0.0.1:9420\"]\n")
 		os.Exit(0)
 	}
 
@@ -69,9 +112,13 @@ func main() {
 	case "memory", "":
 		store = state.NewMemoryStore()
 	case "bolt":
-		// TODO: implement bbolt backend in a future phase.
-		logger.Error("bolt backend not yet implemented, falling back to memory store")
-		store = state.NewMemoryStore()
+		boltStore, boltErr := state.NewBoltStore(cfg.State.BoltPath)
+		if boltErr != nil {
+			logger.Error("failed to open bolt state database — is another instance running?",
+				"path", cfg.State.BoltPath, "err", boltErr)
+			os.Exit(1)
+		}
+		store = boltStore
 	default:
 		logger.Error("unknown state backend", "backend", cfg.State.Backend)
 		os.Exit(1)
@@ -128,11 +175,12 @@ func main() {
 
 	// Build scanner list. ARP and ICMP discover hosts; DNS enriches hostnames;
 	// port scanner probes open TCP ports — all run sequentially per scan cycle.
+	portScanner := scanner.NewPortScanner(store, subnetPorts, nil, cfg.Scanner.PortTimeout, cfg.Scanner.PortMaxWorkers, logger)
 	scanners := []scanner.Scanner{
 		scanner.NewARPScanner(cfg.Scanner.ARPTimeout, cfg.Scanner.ARPRateLimit, logger),
 		scanner.NewICMPScanner(cfg.Scanner.ICMPTimeout, cfg.Scanner.ICMPRateLimit, logger),
 		scanner.NewDNSScanner(store, cfg.DNS.Servers, cfg.DNS.Timeout, logger),
-		scanner.NewPortScanner(store, subnetPorts, nil, cfg.Scanner.PortTimeout, cfg.Scanner.PortMaxWorkers, logger),
+		portScanner,
 	}
 
 	// Load OUI vendor database if configured; failure is non-fatal (degraded mode).
@@ -154,7 +202,10 @@ func main() {
 	// Create structured audit logger. Failure is fatal — don't run without audit if configured.
 	auditLogger, err := audit.NewLogger(audit.Config{
 		Enabled: cfg.Audit.Enabled,
+		Format:  cfg.Audit.Format,
 		Output:  cfg.Audit.Output,
+		Path:    cfg.Audit.Path,
+		Version: version.Version,
 	})
 	if err != nil {
 		logger.Error("failed to create audit logger", "err", err)
@@ -178,6 +229,112 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Track the current reloadable config for diffing on subsequent reloads.
+	currentRC := config.ExtractReloadable(cfg)
+
+	// SIGHUP handler — reloads both the config file and TLS certificates without restarting.
+	// Uses a buffered channel of size 1 so a rapid signal burst doesn't queue.
+	{
+		sighup := make(chan os.Signal, 1)
+		signal.Notify(sighup, syscall.SIGHUP)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-sighup:
+					// --- Config hot-reload ---
+					newCfg, cfgErr := config.LoadConfig(*configPath)
+					if cfgErr != nil {
+						logger.Error("SIGHUP: failed to read config file — keeping old config", "err", cfgErr)
+					} else {
+						newRC := config.ExtractReloadable(newCfg)
+						if valErr := config.ValidateReloadable(newRC); valErr != nil {
+							logger.Error("SIGHUP: new config failed validation — keeping old config", "err", valErr)
+						} else {
+							changes := config.Diff(currentRC, newRC)
+							if len(changes) > 0 {
+								// Load new allowlists from updated file paths.
+								newAllowlists := make(map[string]*scanner.Allowlist)
+								loadErr := false
+								for _, s := range newRC.Subnets {
+									if s.MACAllowlistFile == "" {
+										continue
+									}
+									prefix, _ := netip.ParsePrefix(s.CIDR)
+									al, alErr := scanner.LoadAllowlist(s.MACAllowlistFile)
+									if alErr != nil {
+										logger.Error("SIGHUP: failed to load allowlist — keeping old config",
+											"subnet", s.CIDR, "path", s.MACAllowlistFile, "err", alErr)
+										loadErr = true
+										break
+									}
+									if al != nil {
+										newAllowlists[prefix.String()] = al
+									}
+								}
+								if !loadErr {
+									// Build updated subnet list for the scheduler.
+									newSubnets := make([]scanner.SubnetConfig, 0, len(newRC.Subnets))
+									for _, s := range newRC.Subnets {
+										prefix, _ := netip.ParsePrefix(s.CIDR)
+										interval := s.ScanInterval
+										if interval == 0 {
+											interval = 60 * time.Second
+										}
+										newSubnets = append(newSubnets, scanner.SubnetConfig{
+											Prefix:       prefix,
+											ScanInterval: interval,
+										})
+									}
+									sched.ApplyConfig(scanner.ApplyConfigParams{
+										Subnets:    newSubnets,
+										Allowlists: newAllowlists,
+									})
+
+									// Update port scanner with new per-subnet ports.
+									newSubnetPorts := make(map[string][]uint16)
+									for _, s := range newRC.Subnets {
+										if len(s.Ports) == 0 {
+											continue
+										}
+										prefix, _ := netip.ParsePrefix(s.CIDR)
+										ports := make([]uint16, len(s.Ports))
+										for i, p := range s.Ports {
+											ports[i] = uint16(p) //nolint:gosec // port validated 1–65535
+										}
+										newSubnetPorts[prefix.String()] = ports
+									}
+									portScanner.UpdatePorts(newSubnetPorts)
+
+									currentRC = newRC
+									auditLogger.ConfigReloaded(changes)
+									logger.Info("SIGHUP: config reloaded", "changes", len(changes))
+									for _, c := range changes {
+										logger.Info("SIGHUP: change", "detail", c)
+									}
+								}
+							} else {
+								logger.Info("SIGHUP: config unchanged")
+							}
+						}
+					}
+
+					// --- TLS cert rotation (existing Step 12 behaviour) ---
+					if srv.Reloader() != nil {
+						reloadErr := srv.Reloader().Reload()
+						auditLogger.CertReloaded(cfg.TLS.CertFile, reloadErr)
+						if reloadErr != nil {
+							logger.Error("TLS certificate reload failed", "err", reloadErr)
+						} else {
+							logger.Info("TLS certificate reloaded successfully")
+						}
+					}
+				}
+			}
+		}()
+	}
+
 	// Start the scheduler in the background.
 	go func() {
 		if err := sched.Run(ctx); err != nil && ctx.Err() == nil {
@@ -185,11 +342,18 @@ func main() {
 		}
 	}()
 
+	if fips.Enabled() {
+		logger.Info("FIPS mode enabled")
+	} else {
+		logger.Info("FIPS mode not enabled (standard crypto)")
+	}
+
 	logger.Info("starting signet-exporter",
 		"version", version.Version,
 		"commit", version.Commit,
 		"address", cfg.ListenAddress,
 		"tls", srv.TLSEnabled(),
+		"fips", fips.Enabled(),
 		"subnets", len(cfg.Subnets),
 		"scanners", len(scanners),
 	)

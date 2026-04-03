@@ -4,12 +4,11 @@ package server
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"net/http"
-	"os"
 
 	"github.com/maravexa/signet-exporter/internal/config"
+	"github.com/maravexa/signet-exporter/internal/tlsutil"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -18,6 +17,7 @@ import (
 type Server struct {
 	httpServer *http.Server
 	tlsEnabled bool
+	reloader   *tlsutil.KeypairReloader // nil when TLS not configured
 }
 
 // NewHandler creates the HTTP handler with /metrics, /health, and /ready endpoints.
@@ -64,24 +64,26 @@ func NewServer(cfg *config.Config, col prometheus.Collector, ready <-chan struct
 		Handler: handler,
 	}
 
+	var reloader *tlsutil.KeypairReloader
 	tlsEnabled := false
 	if cfg.TLS.CertFile != "" {
-		tlsCfg, err := buildTLSConfig(&cfg.TLS)
+		tlsCfg, kr, err := buildTLSConfig(&cfg.TLS)
 		if err != nil {
 			return nil, fmt.Errorf("server: build TLS config: %w", err)
 		}
 		httpSrv.TLSConfig = tlsCfg
+		reloader = kr
 		tlsEnabled = true
 	}
 
-	return &Server{httpServer: httpSrv, tlsEnabled: tlsEnabled}, nil
+	return &Server{httpServer: httpSrv, tlsEnabled: tlsEnabled, reloader: reloader}, nil
 }
 
 // Start begins serving. Uses HTTPS when TLS is configured, otherwise plain HTTP.
 // Returns http.ErrServerClosed after a successful Shutdown call.
 func (s *Server) Start() error {
 	if s.tlsEnabled {
-		// Certificate is pre-loaded in TLSConfig.Certificates; empty strings are intentional.
+		// Certificate is served via GetCertificate; empty strings are intentional.
 		return s.httpServer.ListenAndServeTLS("", "")
 	}
 	return s.httpServer.ListenAndServe()
@@ -95,41 +97,42 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // TLSEnabled reports whether the server is configured for HTTPS.
 func (s *Server) TLSEnabled() bool { return s.tlsEnabled }
 
-func buildTLSConfig(cfg *config.TLSConfig) (*tls.Config, error) {
-	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-	}
-	if cfg.MinVersion == "1.2" {
-		tlsCfg.MinVersion = tls.VersionTLS12
+// Reloader returns the KeypairReloader used to serve TLS certificates, or nil
+// if TLS is not configured. Call Reloader().Reload() on SIGHUP to rotate certs
+// without restarting.
+func (s *Server) Reloader() *tlsutil.KeypairReloader { return s.reloader }
+
+// buildTLSConfig constructs a *tls.Config and its associated KeypairReloader
+// from the TLS section of the signet configuration. The reloader is stored by
+// the Server so it can be triggered on SIGHUP for zero-downtime cert rotation.
+func buildTLSConfig(cfg *config.TLSConfig) (*tls.Config, *tlsutil.KeypairReloader, error) {
+	reloader, err := tlsutil.NewKeypairReloader(cfg.CertFile, cfg.KeyFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("load keypair: %w", err)
 	}
 
-	// Pre-load the certificate so ListenAndServeTLS("", "") works correctly.
-	cert, err := tls.LoadX509KeyPair(cfg.CertFile, cfg.KeyFile)
-	if err != nil {
-		return nil, fmt.Errorf("load certificate pair: %w", err)
+	// Default to TLS 1.3; allow operator to lower floor to 1.2 for compatibility.
+	minVer := uint16(tls.VersionTLS13)
+	if cfg.MinVersion == "1.2" {
+		minVer = tls.VersionTLS12
 	}
-	tlsCfg.Certificates = []tls.Certificate{cert}
+
+	tlsCfg := &tls.Config{ //nolint:gosec // G402: TLS 1.2 is intentional — operator controls min_version; AEAD-only ciphers are enforced below.
+		MinVersion:     minVer,
+		GetCertificate: reloader.GetCertificate,
+		// Restrict TLS 1.2 to AEAD-only cipher suites. TLS 1.3 ciphers are
+		// selected automatically by the Go runtime and are not configurable.
+		CipherSuites: tlsutil.AEADCipherSuites,
+	}
 
 	if cfg.ClientCAFile != "" {
-		pool, err := loadCertPool(cfg.ClientCAFile)
-		if err != nil {
-			return nil, fmt.Errorf("load client CA: %w", err)
+		pool, caErr := tlsutil.LoadClientCA(cfg.ClientCAFile)
+		if caErr != nil {
+			return nil, nil, fmt.Errorf("load client CA: %w", caErr)
 		}
 		tlsCfg.ClientCAs = pool
-		tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		tlsCfg.ClientAuth = tlsutil.ParseClientAuthPolicy(cfg.ClientAuthPolicy)
 	}
 
-	return tlsCfg, nil
-}
-
-func loadCertPool(caFile string) (*x509.CertPool, error) {
-	pem, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("no valid certificates found in %q", caFile)
-	}
-	return pool, nil
+	return tlsCfg, reloader, nil
 }

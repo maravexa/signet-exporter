@@ -48,13 +48,35 @@ func Validate(cfg *Config) error {
 }
 
 func validateAudit(a *AuditConfig) error {
-	if !a.Enabled || a.Output == "" || a.Output == "stderr" {
+	switch a.Format {
+	case "", "json", "cef":
+		// valid
+	default:
+		return fmt.Errorf("format must be \"json\" or \"cef\"")
+	}
+
+	if !a.Enabled {
 		return nil
 	}
-	// File output: verify the parent directory exists.
-	dir := filepath.Dir(a.Output)
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		return fmt.Errorf("output: parent directory %q does not exist", dir)
+
+	switch a.Output {
+	case "", "stderr", "stdout":
+		return nil
+	case "file":
+		path := a.Path
+		if path == "" {
+			path = "/var/log/signet/audit.log"
+		}
+		dir := filepath.Dir(path)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			return fmt.Errorf("path: parent directory %q does not exist", dir)
+		}
+	default:
+		// Backward compat: Output treated as a file path.
+		dir := filepath.Dir(a.Output)
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			return fmt.Errorf("output: parent directory %q does not exist", dir)
+		}
 	}
 	return nil
 }
@@ -84,6 +106,12 @@ func validateTLS(tls *TLSConfig) error {
 	// mTLS requires a server cert.
 	if tls.ClientCAFile != "" && tls.CertFile == "" {
 		return fmt.Errorf("client_ca_file requires cert_file and key_file to be set")
+	}
+	switch tls.ClientAuthPolicy {
+	case "", "require_and_verify", "verify_if_given", "no_client_cert":
+		// valid
+	default:
+		return fmt.Errorf("client_auth_policy must be \"require_and_verify\", \"verify_if_given\", or \"no_client_cert\"")
 	}
 	return nil
 }

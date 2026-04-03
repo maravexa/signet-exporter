@@ -49,6 +49,8 @@ archives:
       - LICENSE
       - README.md
       - configs/signet.example.yaml
+      - grafana/signet-overview.json
+      - grafana/README.md
 
   - id: fips
     builds: [fips]

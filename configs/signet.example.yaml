@@ -1,5 +1,11 @@
 # signet-exporter — full annotated example configuration
 # All duration values accept Go duration strings (e.g. 30s, 1m, 2h).
+#
+# Hot-reloadable via SIGHUP (no restart needed):
+#   subnets.*  — add/remove subnets, change scan intervals, ports, allowlist paths
+#
+# Requires restart to take effect:
+#   listen_address, tls.*, dns.*, scanner.*, state.*, oui_database, audit.*
 
 # Address and port on which the /metrics endpoint will be served.
 # NEVER bind to 0.0.0.0 in production; restrict to a management interface.
@@ -7,13 +13,19 @@ listen_address: "127.0.0.1:9420"
 
 # TLS configuration for the /metrics endpoint.
 # Leave cert_file and key_file empty to run without TLS (not recommended in production).
-# Uncomment TLS section to enable TLS (strongly RECOMMENDED in production)
+# Uncomment TLS section to enable TLS (strongly RECOMMENDED in production).
+# Run: signet-exporter --generate-certs /etc/signet/tls  to create a dev cert chain.
 #tls:
-  #cert_file: "/etc/signet/tls/server.crt"
-  #key_file: "/etc/signet/tls/server.key"
-  # Set client_ca_file to enforce mTLS — only clients presenting a cert signed
-  # by this CA will be permitted to scrape /metrics.
-  #client_ca_file: "/etc/signet/tls/client-ca.crt"
+  #cert_file: "/etc/signet/tls/server.pem"
+  #key_file: "/etc/signet/tls/server-key.pem"
+  # Enable mTLS — only Prometheus scrapers presenting a cert signed by this CA
+  # will be permitted to reach /metrics. Requires cert_file + key_file above.
+  #client_ca_file: "/etc/signet/tls/ca.pem"
+  # Client certificate enforcement policy. Only takes effect when client_ca_file is set.
+  #   require_and_verify  — client cert is mandatory and must be CA-signed (default)
+  #   verify_if_given     — verify the cert if presented, but don't require one
+  #   no_client_cert      — do not request a client cert (disables mTLS)
+  #client_auth_policy: "require_and_verify"
   # Minimum TLS version. Supported values: "1.2", "1.3". Default: "1.3".
   #min_version: "1.3"
 
@@ -56,11 +68,15 @@ scanner:
 
 # State persistence backend.
 state:
-  # "memory" — non-persistent, lost on restart.
-  # "bolt"   — persistent bbolt database on disk.
-  backend: "bolt"
-  # Path for the bbolt database file. Only used when backend is "bolt".
-  bolt_path: "/var/lib/signet/state.db"
+  # "memory" — non-persistent; all host state is lost on restart (default).
+  # "bolt"   — persistent bbolt database; state survives restarts.
+  #            Required for continuous MAC-IP binding history and compliance audit trails.
+  backend: "memory"
+  # bolt_path: "/var/lib/signet/state.db"   # database file (bolt backend only)
+  #
+  # Maintenance: compact the database when it grows after many MAC-IP binding
+  # changes. The exporter must be stopped before running compaction:
+  #   signet-exporter --compact-db /var/lib/signet/state.db
 
 # Path to the IEEE OUI vendor database snapshot (ieee-oui.txt format).
 # Download from: https://standards-oui.ieee.org/oui/oui.txt
@@ -69,6 +85,13 @@ oui_database: "/usr/share/signet/oui.txt"
 # Structured audit log settings.
 audit:
   enabled: true
-  # "stderr" sends audit records to standard error.
-  # Any other value is treated as a file path to append to.
-  output: "/var/log/signet/audit.json"
+  # Output format: "json" (default, one JSON object per line) or "cef" (Common Event
+  # Format for SIEM integration, e.g. Splunk, QRadar, ArcSight).
+  format: "json"
+  # Where to write audit records:
+  #   "stderr"  — standard error (default)
+  #   "stdout"  — standard output
+  #   "file"    — append to the file at path (see below)
+  output: "file"
+  # File path, used when output is "file". Parent directory must exist.
+  path: "/var/log/signet/audit.log"

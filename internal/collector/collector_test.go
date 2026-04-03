@@ -10,6 +10,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
+	"github.com/maravexa/signet-exporter/internal/fips"
 	"github.com/maravexa/signet-exporter/internal/state"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -721,6 +722,29 @@ func TestCollect_DuplicateIPDetected(t *testing.T) {
 	cleanSample := findSample(fam, map[string]string{"ip": "10.0.14.2"})
 	if cleanSample != nil {
 		t.Error("host without duplicates should not appear in signet_duplicate_ip_detected")
+	}
+}
+
+func TestCollect_FIPSEnabled(t *testing.T) {
+	store := state.NewMemoryStore()
+	c := newTestCollector(store)
+
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_exporter_fips_enabled")
+	if fam == nil {
+		t.Fatal("signet_exporter_fips_enabled not emitted")
+	}
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(fam.GetMetric()))
+	}
+	val := fam.GetMetric()[0].GetGauge().GetValue()
+	wantVal := 0.0
+	if fips.Enabled() {
+		wantVal = 1.0
+	}
+	if val != wantVal {
+		t.Errorf("signet_exporter_fips_enabled = %v, want %v (fips.Enabled=%v)", val, wantVal, fips.Enabled())
 	}
 }
 

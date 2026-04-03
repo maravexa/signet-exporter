@@ -19,6 +19,7 @@ import (
 // No raw sockets are required; it uses standard net.Dial (TCP connect scan).
 type PortScanner struct {
 	store        state.Store
+	mu           sync.RWMutex        // protects ports; allows hot-reload via UpdatePorts
 	ports        map[string][]uint16 // subnet CIDR string → ports to scan
 	defaultPorts []uint16            // fallback if subnet has no specific port list
 	timeout      time.Duration
@@ -63,15 +64,25 @@ func NewPortScanner(
 // Name returns the scanner identifier.
 func (p *PortScanner) Name() string { return "port" }
 
+// UpdatePorts atomically replaces the per-subnet port map.
+// Safe to call from a SIGHUP handler while Scan is running concurrently.
+func (p *PortScanner) UpdatePorts(ports map[string][]uint16) {
+	p.mu.Lock()
+	p.ports = ports
+	p.mu.Unlock()
+}
+
 // Scan probes each configured port on every known host in subnet.
 // Returns one ScanResult per host that has at least one open port.
 // If no ports are configured for this subnet, returns nil, nil.
 func (p *PortScanner) Scan(ctx context.Context, subnet netip.Prefix) ([]ScanResult, error) {
-	// Determine which ports to scan for this subnet.
+	// Determine which ports to scan for this subnet — read under lock for hot-reload safety.
+	p.mu.RLock()
 	ports := p.ports[subnet.String()]
 	if len(ports) == 0 {
 		ports = p.defaultPorts
 	}
+	p.mu.RUnlock()
 	if len(ports) == 0 {
 		return nil, nil
 	}
