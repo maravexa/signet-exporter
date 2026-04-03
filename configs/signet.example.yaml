@@ -79,6 +79,13 @@ oui_database: "/usr/share/signet/oui.txt"
 # Structured audit log settings.
 audit:
   enabled: true
-  # "stderr" sends audit records to standard error.
-  # Any other value is treated as a file path to append to.
-  output: "/var/log/signet/audit.json"
+  # Output format: "json" (default, one JSON object per line) or "cef" (Common Event
+  # Format for SIEM integration, e.g. Splunk, QRadar, ArcSight).
+  format: "json"
+  # Where to write audit records:
+  #   "stderr"  — standard error (default)
+  #   "stdout"  — standard output
+  #   "file"    — append to the file at path (see below)
+  output: "file"
+  # File path, used when output is "file". Parent directory must exist.
+  path: "/var/log/signet/audit.log"

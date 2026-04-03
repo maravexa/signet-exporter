@@ -382,3 +382,22 @@ The dashboard covers:
 - **Scan Performance** — ARP, ICMP, DNS, and port scan durations
 - **Subnet Utilization** — address space usage per subnet
 - **Security Alerts** — unauthorized devices, duplicate IPs, and DNS mismatches
+
+
+---
+
+## Audit Logging
+
+signet-exporter emits structured audit records for security-relevant events (new hosts, MAC changes, unauthorized devices, scan errors, and TLS certificate reloads).
+
+Records can be written in **JSON** (default, one object per line) or **CEF** (Common Event Format) for SIEM integration with Splunk, QRadar, ArcSight, and similar platforms.
+
+```yaml
+audit:
+  enabled: true
+  format: "json"    # or "cef"
+  output: "file"
+  path: "/var/log/signet/audit.log"
+```
+
+See [`docs/audit-logging.md`](docs/audit-logging.md) for the full event reference, log rotation guidance, and SIEM integration examples.

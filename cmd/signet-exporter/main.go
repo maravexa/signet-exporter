@@ -200,7 +200,10 @@ func main() {
 	// Create structured audit logger. Failure is fatal — don't run without audit if configured.
 	auditLogger, err := audit.NewLogger(audit.Config{
 		Enabled: cfg.Audit.Enabled,
+		Format:  cfg.Audit.Format,
 		Output:  cfg.Audit.Output,
+		Path:    cfg.Audit.Path,
+		Version: version.Version,
 	})
 	if err != nil {
 		logger.Error("failed to create audit logger", "err", err)
@@ -235,8 +238,10 @@ func main() {
 				case <-ctx.Done():
 					return
 				case <-sighup:
-					if err := srv.Reloader().Reload(); err != nil {
-						logger.Error("TLS certificate reload failed", "err", err)
+					reloadErr := srv.Reloader().Reload()
+					auditLogger.CertReloaded(cfg.TLS.CertFile, reloadErr)
+					if reloadErr != nil {
+						logger.Error("TLS certificate reload failed", "err", reloadErr)
 					} else {
 						logger.Info("TLS certificate reloaded successfully")
 					}

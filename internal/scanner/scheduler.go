@@ -173,6 +173,7 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 				"err", err,
 				"duration", duration,
 			)
+			s.auditLog.ScanError(subnetStr, scanner.Name(), err)
 			_ = s.store.RecordScanMeta(ctx, state.ScanMeta{
 				Subnet:    sc.Prefix,
 				Scanner:   scanner.Name(),
@@ -226,6 +227,7 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 			}
 		}
 
+		s.auditLog.ScanCompleted(subnetStr, scanner.Name(), duration, len(results))
 		_ = s.store.RecordScanMeta(ctx, state.ScanMeta{
 			Subnet:    sc.Prefix,
 			Scanner:   scanner.Name(),

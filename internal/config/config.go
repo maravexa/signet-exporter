@@ -63,7 +63,9 @@ type StateConfig struct {
 // AuditConfig holds structured audit log settings.
 type AuditConfig struct {
 	Enabled bool   `yaml:"enabled"`
-	Output  string `yaml:"output"` // "stderr" or file path
+	Format  string `yaml:"format"` // "json" (default) or "cef"
+	Output  string `yaml:"output"` // "stderr" | "stdout" | "file" | <file_path> (backward compat)
+	Path    string `yaml:"path"`   // file path when Output == "file"
 }
 
 // DefaultConfig returns a safe default configuration.
