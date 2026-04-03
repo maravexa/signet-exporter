@@ -62,11 +62,15 @@ scanner:
 
 # State persistence backend.
 state:
-  # "memory" — non-persistent, lost on restart.
-  # "bolt"   — persistent bbolt database on disk.
-  backend: "bolt"
-  # Path for the bbolt database file. Only used when backend is "bolt".
-  bolt_path: "/var/lib/signet/state.db"
+  # "memory" — non-persistent; all host state is lost on restart (default).
+  # "bolt"   — persistent bbolt database; state survives restarts.
+  #            Required for continuous MAC-IP binding history and compliance audit trails.
+  backend: "memory"
+  # bolt_path: "/var/lib/signet/state.db"   # database file (bolt backend only)
+  #
+  # Maintenance: compact the database when it grows after many MAC-IP binding
+  # changes. The exporter must be stopped before running compaction:
+  #   signet-exporter --compact-db /var/lib/signet/state.db
 
 # Path to the IEEE OUI vendor database snapshot (ieee-oui.txt format).
 # Download from: https://standards-oui.ieee.org/oui/oui.txt

@@ -30,12 +30,21 @@ func main() {
 		validateOnly  = flag.Bool("validate", false, "validate configuration and exit")
 		showVersion   = flag.Bool("version", false, "print version information and exit")
 		generateCerts = flag.String("generate-certs", "", "generate a dev CA + server + client cert chain in the given directory and exit")
+		compactDB     = flag.String("compact-db", "", "compact the bbolt state database at the given path and exit (exporter must not be running)")
 	)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("signet-exporter %s (commit: %s, built: %s)\n",
 			version.Version, version.Commit, version.Date)
+		os.Exit(0)
+	}
+
+	if *compactDB != "" {
+		if err := CompactDB(*compactDB); err != nil {
+			fmt.Fprintf(os.Stderr, "error: compact-db: %v\n", err)
+			os.Exit(1)
+		}
 		os.Exit(0)
 	}
 
@@ -102,9 +111,13 @@ func main() {
 	case "memory", "":
 		store = state.NewMemoryStore()
 	case "bolt":
-		// TODO: implement bbolt backend in a future phase.
-		logger.Error("bolt backend not yet implemented, falling back to memory store")
-		store = state.NewMemoryStore()
+		boltStore, boltErr := state.NewBoltStore(cfg.State.BoltPath)
+		if boltErr != nil {
+			logger.Error("failed to open bolt state database — is another instance running?",
+				"path", cfg.State.BoltPath, "err", boltErr)
+			os.Exit(1)
+		}
+		store = boltStore
 	default:
 		logger.Error("unknown state backend", "backend", cfg.State.Backend)
 		os.Exit(1)
