@@ -85,6 +85,12 @@ func validateTLS(tls *TLSConfig) error {
 	if tls.ClientCAFile != "" && tls.CertFile == "" {
 		return fmt.Errorf("client_ca_file requires cert_file and key_file to be set")
 	}
+	switch tls.ClientAuthPolicy {
+	case "", "require_and_verify", "verify_if_given", "no_client_cert":
+		// valid
+	default:
+		return fmt.Errorf("client_auth_policy must be \"require_and_verify\", \"verify_if_given\", or \"no_client_cert\"")
+	}
 	return nil
 }
 

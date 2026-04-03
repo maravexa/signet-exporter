@@ -22,10 +22,11 @@ type Config struct {
 
 // TLSConfig holds TLS and mTLS settings for the metrics endpoint.
 type TLSConfig struct {
-	CertFile     string `yaml:"cert_file"`
-	KeyFile      string `yaml:"key_file"`
-	ClientCAFile string `yaml:"client_ca_file"`
-	MinVersion   string `yaml:"min_version"`
+	CertFile         string `yaml:"cert_file"`
+	KeyFile          string `yaml:"key_file"`
+	ClientCAFile     string `yaml:"client_ca_file"`
+	ClientAuthPolicy string `yaml:"client_auth_policy"` // "require_and_verify" | "verify_if_given" | "no_client_cert"
+	MinVersion       string `yaml:"min_version"`
 }
 
 // SubnetConfig describes a single subnet to scan.

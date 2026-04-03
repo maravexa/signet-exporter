@@ -301,6 +301,75 @@ Apache License 2.0 — see [LICENSE](LICENSE).
 
 ---
 
+## mTLS
+
+Signet supports mutual TLS (mTLS) so that only authenticated Prometheus scrapers can reach `/metrics`. This satisfies SC-8 (Transmission Confidentiality and Integrity) in NIST 800-53 / FedRAMP environments.
+
+### Dev quickstart — generate a cert chain
+
+```bash
+signet-exporter --generate-certs /etc/signet/tls
+```
+
+This creates a self-signed CA, a server cert (SAN: `localhost`, `127.0.0.1`, `::1`), and a client cert — all ECDSA P-256:
+
+```
+/etc/signet/tls/
+  ca.pem            ca-key.pem
+  server.pem        server-key.pem
+  client.pem        client-key.pem
+```
+
+### Enable mTLS in signet.yaml
+
+```yaml
+tls:
+  cert_file: "/etc/signet/tls/server.pem"
+  key_file:  "/etc/signet/tls/server-key.pem"
+  client_ca_file:     "/etc/signet/tls/ca.pem"
+  client_auth_policy: "require_and_verify"   # default when client_ca_file is set
+```
+
+`client_auth_policy` values:
+
+| Value | Behaviour |
+|---|---|
+| `require_and_verify` | Client cert is mandatory and must be CA-signed *(default)* |
+| `verify_if_given` | Verify if presented, but don't require one |
+| `no_client_cert` | Don't request a client cert |
+
+### Configure Prometheus to present the client cert
+
+```yaml
+scrape_configs:
+  - job_name: "signet"
+    scheme: https
+    scrape_interval: 30s
+    scrape_timeout: 10s
+    tls_config:
+      ca_file:   "/etc/signet/tls/ca.pem"
+      cert_file: "/etc/signet/tls/client.pem"
+      key_file:  "/etc/signet/tls/client-key.pem"
+    static_configs:
+      - targets: ["127.0.0.1:9420"]
+```
+
+### Certificate rotation (zero downtime)
+
+Send `SIGHUP` to reload the server cert and key from disk without restarting:
+
+```bash
+# systemd
+systemctl reload signet-exporter
+
+# manual
+kill -HUP $(pidof signet-exporter)
+```
+
+If the new files are invalid, the old certificate remains active and an error is logged. No connections are dropped.
+
+---
+
 ## Grafana Dashboard
 
 A pre-built Grafana dashboard is included in [`grafana/signet-overview.json`](grafana/signet-overview.json).

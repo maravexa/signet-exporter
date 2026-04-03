@@ -20,20 +20,53 @@ import (
 	"github.com/maravexa/signet-exporter/internal/scanner"
 	"github.com/maravexa/signet-exporter/internal/server"
 	"github.com/maravexa/signet-exporter/internal/state"
+	"github.com/maravexa/signet-exporter/internal/tlsutil"
 	"github.com/maravexa/signet-exporter/internal/version"
 )
 
 func main() {
 	var (
-		configPath   = flag.String("config", "/etc/signet/signet.yaml", "path to configuration file")
-		validateOnly = flag.Bool("validate", false, "validate configuration and exit")
-		showVersion  = flag.Bool("version", false, "print version information and exit")
+		configPath    = flag.String("config", "/etc/signet/signet.yaml", "path to configuration file")
+		validateOnly  = flag.Bool("validate", false, "validate configuration and exit")
+		showVersion   = flag.Bool("version", false, "print version information and exit")
+		generateCerts = flag.String("generate-certs", "", "generate a dev CA + server + client cert chain in the given directory and exit")
 	)
 	flag.Parse()
 
 	if *showVersion {
 		fmt.Printf("signet-exporter %s (commit: %s, built: %s)\n",
 			version.Version, version.Commit, version.Date)
+		os.Exit(0)
+	}
+
+	if *generateCerts != "" {
+		if err := tlsutil.GenerateCerts(*generateCerts); err != nil {
+			fmt.Fprintf(os.Stderr, "error: generate-certs: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("Generated TLS certificates in %s/\n\n", *generateCerts)
+		fmt.Printf("  CA cert:        %s/ca.pem\n", *generateCerts)
+		fmt.Printf("  CA key:         %s/ca-key.pem\n", *generateCerts)
+		fmt.Printf("  Server cert:    %s/server.pem\n", *generateCerts)
+		fmt.Printf("  Server key:     %s/server-key.pem\n", *generateCerts)
+		fmt.Printf("  Client cert:    %s/client.pem\n", *generateCerts)
+		fmt.Printf("  Client key:     %s/client-key.pem\n\n", *generateCerts)
+		fmt.Printf("Add the following to your signet.yaml to enable mTLS:\n\n")
+		fmt.Printf("  tls:\n")
+		fmt.Printf("    cert_file: \"%s/server.pem\"\n", *generateCerts)
+		fmt.Printf("    key_file: \"%s/server-key.pem\"\n", *generateCerts)
+		fmt.Printf("    client_ca_file: \"%s/ca.pem\"\n", *generateCerts)
+		fmt.Printf("    client_auth_policy: \"require_and_verify\"\n\n")
+		fmt.Printf("Configure Prometheus to present the client cert when scraping:\n\n")
+		fmt.Printf("  scrape_configs:\n")
+		fmt.Printf("    - job_name: \"signet\"\n")
+		fmt.Printf("      scheme: https\n")
+		fmt.Printf("      tls_config:\n")
+		fmt.Printf("        ca_file: \"%s/ca.pem\"\n", *generateCerts)
+		fmt.Printf("        cert_file: \"%s/client.pem\"\n", *generateCerts)
+		fmt.Printf("        key_file: \"%s/client-key.pem\"\n", *generateCerts)
+		fmt.Printf("      static_configs:\n")
+		fmt.Printf("        - targets: [\"127.0.0.1:9420\"]\n")
 		os.Exit(0)
 	}
 
@@ -177,6 +210,27 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+
+	// SIGHUP handler — reloads TLS certificates without restarting.
+	// Uses a buffered channel of size 1 so a rapid signal burst doesn't queue.
+	if srv.Reloader() != nil {
+		sighup := make(chan os.Signal, 1)
+		signal.Notify(sighup, syscall.SIGHUP)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-sighup:
+					if err := srv.Reloader().Reload(); err != nil {
+						logger.Error("TLS certificate reload failed", "err", err)
+					} else {
+						logger.Info("TLS certificate reloaded successfully")
+					}
+				}
+			}
+		}()
+	}
 
 	// Start the scheduler in the background.
 	go func() {
