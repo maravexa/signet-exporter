@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/maravexa/signet-exporter/internal/fips"
@@ -27,8 +28,14 @@ type SignetCollector struct {
 	subnets []netip.Prefix
 	logger  *slog.Logger
 
+	// portCount is the maximum port list length across all configured subnets.
+	// Updated via SetPortCount for hot-reload safety.
+	portCount atomic.Int64
+
 	// Metric descriptors — created once in the constructor, reused on every Collect.
 	hostUp                    *prometheus.Desc
+	hostInfo                  *prometheus.Desc
+	activeSeriesEstimate      *prometheus.Desc
 	scanDuration              *prometheus.Desc
 	lastScanTimestamp         *prometheus.Desc
 	duplicateIP               *prometheus.Desc
@@ -45,19 +52,36 @@ type SignetCollector struct {
 
 // NewSignetCollector creates a collector wired to the given state store, subnet list, and logger.
 // If logger is nil, slog.Default() is used.
+// portCount is the maximum port list length across all configured subnets (used for
+// signet_active_series_estimate). Pass 0 if unknown; the estimate will be conservative.
 func NewSignetCollector(store state.Store, subnets []netip.Prefix, logger *slog.Logger) *SignetCollector {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &SignetCollector{
+	c := &SignetCollector{
 		store:   store,
 		subnets: subnets,
 		logger:  logger,
 
+		// hostUp: low-cardinality, high-query. ip and subnet only.
+		// Breaking change from v0.4.0: mac, vendor, hostname removed; see signet_host_info.
 		hostUp: prometheus.NewDesc(
 			"signet_host_up",
 			"1 if the host responded during the most recent scan, 0 otherwise.",
+			[]string{"ip", "subnet"}, nil,
+		),
+		// hostInfo: enrichment labels, always value 1. Join with signet_host_up in PromQL.
+		hostInfo: prometheus.NewDesc(
+			"signet_host_info",
+			"Enrichment metadata for a known host. Value is always 1. Join with signet_host_up on (ip, subnet). "+
+				"mac, vendor, hostname labels are stable identifiers for the host.",
 			[]string{"ip", "mac", "vendor", "hostname", "subnet"}, nil,
+		),
+		activeSeriesEstimate: prometheus.NewDesc(
+			"signet_active_series_estimate",
+			"Estimated number of active Prometheus series based on current host count and configuration. "+
+				"Estimate uses configured port list length as worst-case; actual series will be lower if not all ports are open on all hosts.",
+			nil, nil,
 		),
 		scanDuration: prometheus.NewDesc(
 			"signet_scan_duration_seconds",
@@ -120,11 +144,20 @@ func NewSignetCollector(store state.Store, subnets []netip.Prefix, logger *slog.
 			nil, nil,
 		),
 	}
+	return c
+}
+
+// SetPortCount updates the maximum configured port list length for use in
+// signet_active_series_estimate. Safe to call concurrently (uses atomic).
+func (c *SignetCollector) SetPortCount(n int) {
+	c.portCount.Store(int64(n))
 }
 
 // Describe sends all metric descriptors to ch. Called once at registration time.
 func (c *SignetCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.hostUp
+	ch <- c.hostInfo
+	ch <- c.activeSeriesEstimate
 	ch <- c.scanDuration
 	ch <- c.lastScanTimestamp
 	ch <- c.duplicateIP
@@ -161,6 +194,9 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 	ch <- prometheus.MustNewConstMetric(c.fipsEnabled, prometheus.GaugeValue, fipsVal)
 
 	now := time.Now()
+	portCount := c.portCount.Load()
+	subnetCount := float64(len(c.subnets))
+	var totalHostCount float64
 
 	for _, subnet := range c.subnets {
 		subnetStr := subnet.String()
@@ -170,6 +206,8 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 			c.logger.Warn("collector: ListHosts failed", "subnet", subnetStr, "err", err)
 			continue
 		}
+
+		totalHostCount += float64(len(hosts))
 
 		// Subnet utilization.
 		ch <- prometheus.MustNewConstMetric(
@@ -188,26 +226,39 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 		// Per-host metrics.
 		for _, host := range hosts {
 			ipStr := host.IP.String()
-			macStr := host.MAC.String()
-			vendor := host.Vendor
-			if vendor == "" {
-				vendor = "unknown"
-			}
 
-			// signet_host_up: 0 if the host hasn't been seen within the staleness window.
-			// TODO: use per-subnet scan interval for staleness once the scheduler exposes it.
-			upVal := 1.0
-			if now.Sub(host.LastSeen) > stalenessThreshold {
-				upVal = 0.0
+			// Resolve label values — never emit empty strings for enrichment labels.
+			macStr := labelOrUnknown(host.MAC.String())
+			if len(host.MAC) == 0 {
+				macStr = "unknown"
 			}
+			vendor := labelOrUnknown(host.Vendor)
 			hostname := ""
 			if len(host.Hostnames) > 0 {
 				hostname = host.Hostnames[0]
+			}
+			hostname = labelOrUnknown(hostname)
+
+			// signet_host_up: only ip and subnet labels (low-cardinality).
+			// 0 if the host hasn't been seen within the staleness window.
+			upVal := 1.0
+			if now.Sub(host.LastSeen) > stalenessThreshold {
+				upVal = 0.0
 			}
 			ch <- prometheus.MustNewConstMetric(
 				c.hostUp,
 				prometheus.GaugeValue,
 				upVal,
+				ipStr, subnetStr,
+			)
+
+			// signet_host_info: enrichment labels, always 1.
+			// Emitted for every known host regardless of Up status — a host that is
+			// down is still known and its metadata is still valid.
+			ch <- prometheus.MustNewConstMetric(
+				c.hostInfo,
+				prometheus.GaugeValue,
+				1.0,
 				ipStr, macStr, vendor, hostname, subnetStr,
 			)
 
@@ -243,12 +294,12 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 			}
 
 			// signet_dns_forward_reverse_mismatch: one sample per mismatched hostname.
-			for _, hostname := range host.DNSMismatches {
+			for _, hn := range host.DNSMismatches {
 				ch <- prometheus.MustNewConstMetric(
 					c.dnsForwardReverseMismatch,
 					prometheus.GaugeValue,
 					1,
-					ipStr, hostname, subnetStr,
+					ipStr, hn, subnetStr,
 				)
 			}
 
@@ -256,7 +307,7 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 			// The macs label contains all claimants (primary first) as a comma-separated string.
 			if len(host.DuplicateMACs) > 0 {
 				allMACs := make([]string, 0, 1+len(host.DuplicateMACs))
-				allMACs = append(allMACs, macStr)
+				allMACs = append(allMACs, host.MAC.String())
 				for _, dm := range host.DuplicateMACs {
 					allMACs = append(allMACs, dm.String())
 				}
@@ -307,4 +358,35 @@ func (c *SignetCollector) Collect(ch chan<- prometheus.Metric) {
 			)
 		}
 	}
+
+	// signet_active_series_estimate: conservative estimate of total active series.
+	//
+	// Series per host:
+	//   signet_host_up:                      1
+	//   signet_host_info:                    1
+	//   signet_port_open (per port):         portCount (worst case)
+	//   signet_dns_forward_reverse_mismatch: up to 1
+	//   signet_unauthorized_device_detected: up to 1
+	//   signet_duplicate_ip_detected:        up to 1
+	// Conservative per-host multiplier = 3 + portCount.
+	perHostSeries := 3.0 + float64(portCount)
+
+	// Subnet-level series (independent of host count):
+	//   signet_scan_duration_seconds (per subnet × scanner): subnetCount × 4
+	//   signet_last_scan_timestamp:    subnetCount
+	//   signet_subnet_addresses_used:  subnetCount
+	//   signet_subnet_addresses_total: subnetCount
+	subnetSeries := subnetCount * 7.0
+
+	estimate := totalHostCount*perHostSeries + subnetSeries
+	ch <- prometheus.MustNewConstMetric(c.activeSeriesEstimate, prometheus.GaugeValue, estimate)
+}
+
+// labelOrUnknown returns s if non-empty, otherwise "unknown".
+// Prevents empty label values in Prometheus which create ambiguous time series.
+func labelOrUnknown(s string) string {
+	if s == "" {
+		return "unknown"
+	}
+	return s
 }

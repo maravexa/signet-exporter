@@ -68,6 +68,16 @@ func labelsMatch(got []*dto.LabelPair, want map[string]string) bool {
 	return true
 }
 
+// hasLabel returns true if the metric carries a label with the given name.
+func hasLabel(m *dto.Metric, name string) bool {
+	for _, lp := range m.GetLabel() {
+		if lp.GetName() == name {
+			return true
+		}
+	}
+	return false
+}
+
 func makeHost(ip, mac string, opts ...func(*state.HostRecord)) state.HostRecord {
 	hw, err := net.ParseMAC(mac)
 	if err != nil {
@@ -145,10 +155,9 @@ func TestCollect_HostUp(t *testing.T) {
 		t.Fatalf("expected 3 host_up samples, got %d", len(fam.GetMetric()))
 	}
 	for _, h := range hosts {
+		// host_up must match on ip + subnet only (no mac/vendor/hostname).
 		sample := findSample(fam, map[string]string{
 			"ip":     h.ip,
-			"mac":    h.mac,
-			"vendor": h.vendor,
 			"subnet": subnet,
 		})
 		if sample == nil {
@@ -599,65 +608,6 @@ func TestCollect_DNSNoMismatch(t *testing.T) {
 	}
 }
 
-func TestCollect_HostUp_HostnameLabel_Populated(t *testing.T) {
-	ctx := context.Background()
-	store := state.NewMemoryStore()
-	subnet := "10.0.12.0/24"
-
-	rec := makeHost("10.0.12.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
-		r.Hostnames = []string{"host1.example.com", "alias.example.com"}
-	})
-	if _, err := store.UpdateHost(ctx, rec); err != nil {
-		t.Fatal(err)
-	}
-
-	c := newTestCollector(store, subnet)
-	families := collectMetrics(c)
-
-	fam := findMetric(families, "signet_host_up")
-	if fam == nil {
-		t.Fatal("signet_host_up not emitted")
-	}
-	s := findSample(fam, map[string]string{
-		"ip":       "10.0.12.1",
-		"hostname": "host1.example.com",
-		"subnet":   subnet,
-	})
-	if s == nil {
-		t.Error("no host_up sample with first hostname label")
-	}
-}
-
-func TestCollect_HostUp_HostnameLabel_Empty(t *testing.T) {
-	ctx := context.Background()
-	store := state.NewMemoryStore()
-	subnet := "10.0.13.0/24"
-
-	// Host with no hostnames: label should be empty string.
-	rec := makeHost("10.0.13.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
-		r.Hostnames = nil
-	})
-	if _, err := store.UpdateHost(ctx, rec); err != nil {
-		t.Fatal(err)
-	}
-
-	c := newTestCollector(store, subnet)
-	families := collectMetrics(c)
-
-	fam := findMetric(families, "signet_host_up")
-	if fam == nil {
-		t.Fatal("signet_host_up not emitted")
-	}
-	s := findSample(fam, map[string]string{
-		"ip":       "10.0.13.1",
-		"hostname": "",
-		"subnet":   subnet,
-	})
-	if s == nil {
-		t.Error("no host_up sample with empty hostname label for host with no hostnames")
-	}
-}
-
 func TestCollect_DuplicateIPDetected(t *testing.T) {
 	ctx := context.Background()
 	store := state.NewMemoryStore()
@@ -760,5 +710,389 @@ func TestCollect_NoScanMeta_NoEmission(t *testing.T) {
 	}
 	if fam := findMetric(families, "signet_last_scan_timestamp"); fam != nil && len(fam.GetMetric()) > 0 {
 		t.Errorf("signet_last_scan_timestamp should not be emitted without scan metadata, got %d samples", len(fam.GetMetric()))
+	}
+}
+
+// --- Step 18: Info metric split tests ---
+
+func TestHostInfoEmittedForDownHost(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.20.0/24"
+
+	// Host is stale (last seen 10 minutes ago, so host_up = 0).
+	rec := makeHost("10.0.20.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.LastSeen = time.Now().Add(-10 * time.Minute)
+		r.Vendor = "DownVendor"
+	})
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	// host_up must be 0.
+	upFam := findMetric(families, "signet_host_up")
+	if upFam == nil {
+		t.Fatal("signet_host_up not emitted for down host")
+	}
+	upSample := findSample(upFam, map[string]string{"ip": "10.0.20.1", "subnet": subnet})
+	if upSample == nil {
+		t.Fatal("no host_up sample for down host")
+	}
+	if upSample.GetGauge().GetValue() != 0.0 {
+		t.Errorf("down host: host_up = %v, want 0", upSample.GetGauge().GetValue())
+	}
+
+	// host_info must still be emitted even though host is down.
+	infoFam := findMetric(families, "signet_host_info")
+	if infoFam == nil {
+		t.Fatal("signet_host_info not emitted for down host")
+	}
+	infoSample := findSample(infoFam, map[string]string{"ip": "10.0.20.1", "subnet": subnet})
+	if infoSample == nil {
+		t.Fatal("no host_info sample for down host")
+	}
+	if infoSample.GetGauge().GetValue() != 1.0 {
+		t.Errorf("host_info value = %v, want 1", infoSample.GetGauge().GetValue())
+	}
+}
+
+func TestHostInfoLabels(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.21.0/24"
+
+	rec := makeHost("10.0.21.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.Vendor = "ACME Corp"
+		r.Hostnames = []string{"acme.example.com"}
+	})
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	// host_info must carry mac, vendor, hostname, ip, subnet.
+	infoFam := findMetric(families, "signet_host_info")
+	if infoFam == nil {
+		t.Fatal("signet_host_info not emitted")
+	}
+	infoSample := findSample(infoFam, map[string]string{
+		"ip":       "10.0.21.1",
+		"mac":      "aa:bb:cc:dd:ee:01",
+		"vendor":   "ACME Corp",
+		"hostname": "acme.example.com",
+		"subnet":   subnet,
+	})
+	if infoSample == nil {
+		t.Fatal("host_info sample missing expected labels")
+	}
+}
+
+func TestHostUpLabelsReduced(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.22.0/24"
+
+	rec := makeHost("10.0.22.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.Vendor = "SomeVendor"
+		r.Hostnames = []string{"somehost.example.com"}
+	})
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	upFam := findMetric(families, "signet_host_up")
+	if upFam == nil {
+		t.Fatal("signet_host_up not emitted")
+	}
+	if len(upFam.GetMetric()) == 0 {
+		t.Fatal("no host_up samples")
+	}
+	m := upFam.GetMetric()[0]
+
+	// host_up must NOT carry mac, vendor, hostname.
+	for _, forbidden := range []string{"mac", "vendor", "hostname"} {
+		if hasLabel(m, forbidden) {
+			t.Errorf("host_up carries forbidden label %q", forbidden)
+		}
+	}
+	// host_up must carry ip and subnet.
+	for _, required := range []string{"ip", "subnet"} {
+		if !hasLabel(m, required) {
+			t.Errorf("host_up missing required label %q", required)
+		}
+	}
+}
+
+func TestHostInfoUnknownFallback(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.23.0/24"
+
+	// Host with nil MAC, empty vendor, no hostnames.
+	rec := state.HostRecord{
+		IP:       netip.MustParseAddr("10.0.23.1"),
+		MAC:      nil, // nil MAC
+		Vendor:   "",  // empty vendor
+		LastSeen: time.Now(),
+		Alive:    true,
+	}
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	infoFam := findMetric(families, "signet_host_info")
+	if infoFam == nil {
+		t.Fatal("signet_host_info not emitted")
+	}
+	infoSample := findSample(infoFam, map[string]string{
+		"ip":       "10.0.23.1",
+		"mac":      "unknown",
+		"vendor":   "unknown",
+		"hostname": "unknown",
+		"subnet":   subnet,
+	})
+	if infoSample == nil {
+		t.Fatal("host_info must use 'unknown' for nil MAC, empty vendor, and empty hostname")
+	}
+}
+
+func TestBothMetricsEmittedPerHost(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.24.0/24"
+
+	const N = 5
+	for i := 1; i <= N; i++ {
+		ip := netip.AddrFrom4([4]byte{10, 0, 24, byte(i)}).String()
+		mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, byte(i)}.String()
+		if _, err := store.UpdateHost(ctx, makeHost(ip, mac)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	upFam := findMetric(families, "signet_host_up")
+	if upFam == nil || len(upFam.GetMetric()) != N {
+		t.Errorf("expected %d host_up samples, got %d", N, len(upFam.GetMetric()))
+	}
+
+	infoFam := findMetric(families, "signet_host_info")
+	if infoFam == nil || len(infoFam.GetMetric()) != N {
+		t.Errorf("expected %d host_info samples, got %d", N, len(infoFam.GetMetric()))
+	}
+}
+
+// --- Step 19: Active series estimate tests ---
+
+func TestActiveSeriesEstimateZeroHosts(t *testing.T) {
+	store := state.NewMemoryStore()
+	// No subnets, no hosts.
+	c := NewSignetCollector(store, nil, nil)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_active_series_estimate")
+	if fam == nil {
+		t.Fatal("signet_active_series_estimate not emitted")
+	}
+	val := fam.GetMetric()[0].GetGauge().GetValue()
+	if val != 0.0 {
+		t.Errorf("estimate with no hosts and no subnets = %v, want 0", val)
+	}
+}
+
+func TestActiveSeriesEstimateScalesWithPorts(t *testing.T) {
+	ctx := context.Background()
+	subnet := "10.0.30.0/24"
+	const hostCount = 10
+
+	storeA := state.NewMemoryStore()
+	storeB := state.NewMemoryStore()
+	for i := 1; i <= hostCount; i++ {
+		ip := netip.AddrFrom4([4]byte{10, 0, 30, byte(i)}).String()
+		mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, byte(i)}.String()
+		rec := makeHost(ip, mac)
+		if _, err := storeA.UpdateHost(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := storeB.UpdateHost(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Collector with 1 port.
+	cA := newTestCollector(storeA, subnet)
+	cA.SetPortCount(1)
+
+	// Collector with 5 ports.
+	cB := newTestCollector(storeB, subnet)
+	cB.SetPortCount(5)
+
+	famA := findMetric(collectMetrics(cA), "signet_active_series_estimate")
+	famB := findMetric(collectMetrics(cB), "signet_active_series_estimate")
+
+	if famA == nil || famB == nil {
+		t.Fatal("signet_active_series_estimate not emitted")
+	}
+
+	estA := famA.GetMetric()[0].GetGauge().GetValue()
+	estB := famB.GetMetric()[0].GetGauge().GetValue()
+
+	if estB <= estA {
+		t.Errorf("estimate with 5 ports (%v) should be greater than with 1 port (%v)", estB, estA)
+	}
+}
+
+func TestActiveSeriesEstimateScalesWithHosts(t *testing.T) {
+	ctx := context.Background()
+	subnet := "10.0.31.0/24"
+
+	storeSmall := state.NewMemoryStore()
+	storeLarge := state.NewMemoryStore()
+
+	// 10 hosts in small, 100 hosts in large.
+	for i := 1; i <= 100; i++ {
+		ip := netip.AddrFrom4([4]byte{10, 0, 31, byte(i)}).String()
+		mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, byte(i)}.String()
+		rec := makeHost(ip, mac)
+		if i <= 10 {
+			if _, err := storeSmall.UpdateHost(ctx, rec); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := storeLarge.UpdateHost(ctx, rec); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cSmall := newTestCollector(storeSmall, subnet)
+	cSmall.SetPortCount(3)
+	cLarge := newTestCollector(storeLarge, subnet)
+	cLarge.SetPortCount(3)
+
+	famSmall := findMetric(collectMetrics(cSmall), "signet_active_series_estimate")
+	famLarge := findMetric(collectMetrics(cLarge), "signet_active_series_estimate")
+
+	if famSmall == nil || famLarge == nil {
+		t.Fatal("signet_active_series_estimate not emitted")
+	}
+
+	estSmall := famSmall.GetMetric()[0].GetGauge().GetValue()
+	estLarge := famLarge.GetMetric()[0].GetGauge().GetValue()
+
+	if estLarge <= estSmall {
+		t.Errorf("estimate with 100 hosts (%v) should be greater than with 10 hosts (%v)", estLarge, estSmall)
+	}
+}
+
+func TestActiveSeriesEstimatePresent(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.32.0/24"
+
+	rec := makeHost("10.0.32.1", "aa:bb:cc:dd:ee:01")
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	c.SetPortCount(3)
+	families := collectMetrics(c)
+
+	fam := findMetric(families, "signet_active_series_estimate")
+	if fam == nil {
+		t.Fatal("signet_active_series_estimate not present in gathered output")
+	}
+	if len(fam.GetMetric()) != 1 {
+		t.Fatalf("expected 1 sample, got %d", len(fam.GetMetric()))
+	}
+	val := fam.GetMetric()[0].GetGauge().GetValue()
+	if val <= 0 {
+		t.Errorf("signet_active_series_estimate = %v, want > 0 with hosts and ports", val)
+	}
+}
+
+// TestCollect_HostUp_HostnameLabel_Populated verifies hostname appears on host_info, not host_up.
+func TestCollect_HostUp_HostnameLabel_Populated(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.12.0/24"
+
+	rec := makeHost("10.0.12.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.Hostnames = []string{"host1.example.com", "alias.example.com"}
+	})
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	// hostname must appear on host_info.
+	infoFam := findMetric(families, "signet_host_info")
+	if infoFam == nil {
+		t.Fatal("signet_host_info not emitted")
+	}
+	s := findSample(infoFam, map[string]string{
+		"ip":       "10.0.12.1",
+		"hostname": "host1.example.com",
+		"subnet":   subnet,
+	})
+	if s == nil {
+		t.Error("no host_info sample with first hostname label")
+	}
+
+	// hostname must NOT appear on host_up.
+	upFam := findMetric(families, "signet_host_up")
+	if upFam == nil {
+		t.Fatal("signet_host_up not emitted")
+	}
+	for _, m := range upFam.GetMetric() {
+		if hasLabel(m, "hostname") {
+			t.Error("host_up must not carry hostname label")
+		}
+	}
+}
+
+// TestCollect_HostUp_HostnameLabel_Empty verifies that empty hostname falls back to "unknown" on host_info.
+func TestCollect_HostUp_HostnameLabel_Empty(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.13.0/24"
+
+	rec := makeHost("10.0.13.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.Hostnames = nil
+	})
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+
+	// host_info must use "unknown" for missing hostname.
+	infoFam := findMetric(families, "signet_host_info")
+	if infoFam == nil {
+		t.Fatal("signet_host_info not emitted")
+	}
+	s := findSample(infoFam, map[string]string{
+		"ip":       "10.0.13.1",
+		"hostname": "unknown",
+		"subnet":   subnet,
+	})
+	if s == nil {
+		t.Error("host_info must use 'unknown' for missing hostname, not empty string")
 	}
 }

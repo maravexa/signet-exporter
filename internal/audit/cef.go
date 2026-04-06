@@ -40,6 +40,7 @@ const (
 	cefIDConfigReloaded    = 700
 	cefIDCertReloaded      = 800
 	cefIDHostDisappeared   = 150
+	cefIDHostExpired       = 160
 	cefIDScanCycleComplete = 550
 )
 
@@ -119,6 +120,15 @@ func (c *CEFFormatter) HostDisappeared(ip net.IP, subnet string, mac net.Hardwar
 		"subnet", subnet,
 		"mac", mac.String(),
 		"vendor", vendor,
+		"lastSeen", lastSeen.UTC().Format(time.RFC3339),
+	))
+}
+
+// HostExpired logs a host being pruned by the TTL eviction mechanism.
+func (c *CEFFormatter) HostExpired(ip string, subnet string, lastSeen time.Time) {
+	c.writeLine(cefIDHostExpired, "Host Expired", 3, ext(
+		"src", ip,
+		"subnet", subnet,
 		"lastSeen", lastSeen.UTC().Format(time.RFC3339),
 	))
 }

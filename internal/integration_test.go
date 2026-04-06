@@ -74,6 +74,7 @@ func TestFullStack_MockScan_MetricsExposed(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		0,
 	)
 
 	col := collector.NewSignetCollector(store, []netip.Prefix{subnet}, nil)
@@ -165,6 +166,7 @@ func TestFullStack_ReadyGating(t *testing.T) {
 		nil,
 		nil,
 		nil,
+		0,
 	)
 
 	col := collector.NewSignetCollector(store, []netip.Prefix{subnet}, nil)

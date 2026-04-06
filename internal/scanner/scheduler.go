@@ -24,6 +24,7 @@ type SubnetConfig struct {
 type ApplyConfigParams struct {
 	Subnets    []SubnetConfig        // updated subnet list (Prefix + ScanInterval)
 	Allowlists map[string]*Allowlist // prefix string → allowlist; nil entry = no auth check
+	HostTTL    time.Duration         // duration after which unseen hosts are pruned; 0 disables eviction
 }
 
 // Scheduler drives periodic subnet scans with a configurable concurrency limit.
@@ -44,6 +45,7 @@ type Scheduler struct {
 	mu         sync.RWMutex
 	subnets    []SubnetConfig        // current subnet list
 	allowlists map[string]*Allowlist // key: subnet prefix string; nil map = no allowlists
+	hostTTL    time.Duration         // 0 means disabled
 
 	// runCtx is set by Run() and used by ApplyConfig to start goroutines for new subnets.
 	// Written once by Run() under mu before any goroutines read it; safe to read without lock
@@ -57,6 +59,7 @@ type Scheduler struct {
 // ouiDB may be nil; when nil, vendor enrichment is skipped silently.
 // auditLog may be nil; when nil, a no-op disabled logger is used.
 // allowlists may be nil; when nil, no authorization checks are performed.
+// hostTTL is the duration after which unseen hosts are pruned; 0 disables eviction.
 func NewScheduler(
 	scanners []Scanner,
 	store state.Store,
@@ -66,6 +69,7 @@ func NewScheduler(
 	ouiDB *oui.Database,
 	auditLog *audit.Logger,
 	allowlists map[string]*Allowlist,
+	hostTTL time.Duration,
 ) *Scheduler {
 	if maxParallel <= 0 {
 		maxParallel = 1
@@ -86,6 +90,7 @@ func NewScheduler(
 		auditLog:   auditLog,
 		allowlists: allowlists,
 		subnets:    subnets,
+		hostTTL:    hostTTL,
 		semaphore:  make(chan struct{}, maxParallel),
 		logger:     logger,
 		readyCh:    make(chan struct{}),
@@ -111,6 +116,7 @@ func (s *Scheduler) ApplyConfig(params ApplyConfigParams) {
 	oldSubnets := s.subnets
 	s.subnets = params.Subnets
 	s.allowlists = params.Allowlists
+	s.hostTTL = params.HostTTL
 	runCtx := s.runCtx
 	s.mu.Unlock()
 
@@ -157,6 +163,13 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	subnets := append([]SubnetConfig{}, s.subnets...)
 	s.mu.Unlock()
 
+	// Start the TTL prune goroutine if eviction is enabled.
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.runPrune(ctx)
+	}()
+
 	if len(subnets) == 0 {
 		// No subnets configured — signal ready immediately and wait for shutdown.
 		s.readyOnce.Do(func() { close(s.readyCh) })
@@ -192,6 +205,70 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	<-ctx.Done()
 	s.wg.Wait()
 	return nil
+}
+
+// runPrune runs the TTL eviction loop. It ticks at TTL/2 and prunes hosts whose
+// LastSeen exceeds the current TTL. If TTL is zero, the loop sleeps until context
+// cancellation (eviction disabled). TTL changes via ApplyConfig take effect on
+// the next tick.
+func (s *Scheduler) runPrune(ctx context.Context) {
+	for {
+		s.mu.RLock()
+		ttl := s.hostTTL
+		s.mu.RUnlock()
+
+		if ttl <= 0 {
+			// Eviction disabled — wait for context cancellation or a config change.
+			// Poll infrequently to pick up TTL changes applied via ApplyConfig.
+			t := time.NewTimer(30 * time.Second)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+				continue
+			}
+		}
+
+		interval := ttl / 2
+		t := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+
+		// Re-read TTL after the timer fires; it may have changed via ApplyConfig.
+		s.mu.RLock()
+		ttl = s.hostTTL
+		s.mu.RUnlock()
+		if ttl <= 0 {
+			continue
+		}
+
+		removed, err := s.store.PruneStale(ttl)
+		if err != nil {
+			s.logger.Warn("scheduler: PruneStale failed", "err", err)
+			continue
+		}
+
+		if len(removed) == 0 {
+			continue
+		}
+
+		// Snapshot the current subnet list to resolve subnet membership.
+		s.mu.RLock()
+		subnets := append([]SubnetConfig{}, s.subnets...)
+		s.mu.RUnlock()
+
+		pruneTime := time.Now()
+		for _, ipStr := range removed {
+			s.logger.Info("scheduler: host expired by TTL", "ip", ipStr)
+			subnet := subnetForIP(ipStr, subnets)
+			s.auditLog.HostExpired(ipStr, subnet, pruneTime)
+		}
+	}
 }
 
 // runSubnet runs an immediate first scan, signals completion, then waits the current
@@ -357,6 +434,21 @@ func (s *Scheduler) scanSubnet(ctx context.Context, sc SubnetConfig) {
 	if al != nil {
 		s.checkAuthorization(ctx, sc, al)
 	}
+}
+
+// subnetForIP returns the string representation of the first configured subnet that contains
+// the given IP string. Returns an empty string if the IP cannot be parsed or no subnet matches.
+func subnetForIP(ipStr string, subnets []SubnetConfig) string {
+	ip, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		return ""
+	}
+	for _, sc := range subnets {
+		if sc.Prefix.Contains(ip) {
+			return sc.Prefix.String()
+		}
+	}
+	return ""
 }
 
 // checkAuthorization checks each known host in the subnet against the MAC allowlist,

@@ -25,6 +25,7 @@ type ReloadableSubnet struct {
 //   - state.* (backend switch requires store migration)
 type ReloadableConfig struct {
 	Subnets []ReloadableSubnet
+	HostTTL time.Duration // 0 = use 3× minimum scan interval default
 }
 
 // ExtractReloadable extracts the mutable portion from a full Config.
@@ -42,7 +43,7 @@ func ExtractReloadable(cfg *Config) ReloadableConfig {
 			MACAllowlistFile: s.MACAllowlistFile,
 		}
 	}
-	return ReloadableConfig{Subnets: subnets}
+	return ReloadableConfig{Subnets: subnets, HostTTL: cfg.HostTTL}
 }
 
 // ValidateReloadable checks the mutable config subset for logical errors.
@@ -115,6 +116,10 @@ func Diff(old, new ReloadableConfig) []string {
 		if os.MACAllowlistFile != ns.MACAllowlistFile {
 			changes = append(changes, fmt.Sprintf("subnet %s: allowlist %s → %s", cidr, os.MACAllowlistFile, ns.MACAllowlistFile))
 		}
+	}
+
+	if old.HostTTL != new.HostTTL {
+		changes = append(changes, fmt.Sprintf("host_ttl: %s → %s", old.HostTTL, new.HostTTL))
 	}
 
 	sort.Strings(changes)

@@ -20,6 +20,7 @@ const (
 	EventMACIPChange        EventType = "mac_ip_change"
 	EventNewHost            EventType = "new_host_discovered"
 	EventHostDisappeared    EventType = "host_disappeared"
+	EventHostExpired        EventType = "host_expired"
 	EventUnauthorizedDevice EventType = "unauthorized_device"
 	EventScanCycleComplete  EventType = "scan_cycle_complete"
 	EventDuplicateIP        EventType = "duplicate_ip_detected"
@@ -35,6 +36,7 @@ type auditBackend interface {
 	NewHost(ip net.IP, subnet string, mac net.HardwareAddr, vendor, hostname string)
 	MACIPChange(ip net.IP, subnet string, oldMAC, newMAC net.HardwareAddr, oldVendor, newVendor string)
 	HostDisappeared(ip net.IP, subnet string, mac net.HardwareAddr, vendor string, lastSeen time.Time)
+	HostExpired(ip string, subnet string, lastSeen time.Time)
 	UnauthorizedDevice(ip net.IP, subnet string, mac net.HardwareAddr, vendor string)
 	DuplicateIP(ip net.IP, subnet string, primaryMAC net.HardwareAddr, duplicateMACs []net.HardwareAddr)
 	ScanCycleComplete(subnet string, hostsFound int, duration time.Duration, scannersRun []string)
@@ -152,6 +154,14 @@ func (l *Logger) HostDisappeared(ip net.IP, subnet string, mac net.HardwareAddr,
 	l.backend.HostDisappeared(ip, subnet, mac, vendor, lastSeen)
 }
 
+// HostExpired logs a host being pruned by the TTL eviction mechanism.
+// ip is the string representation of the expired host's IP address.
+// subnet is the subnet the host belonged to.
+// lastSeen is the timestamp of the last scan in which the host was observed.
+func (l *Logger) HostExpired(ip string, subnet string, lastSeen time.Time) {
+	l.backend.HostExpired(ip, subnet, lastSeen)
+}
+
 // UnauthorizedDevice logs detection of a device not on the MAC allowlist.
 func (l *Logger) UnauthorizedDevice(ip net.IP, subnet string, mac net.HardwareAddr, vendor string) {
 	l.backend.UnauthorizedDevice(ip, subnet, mac, vendor)
@@ -231,6 +241,15 @@ func (j *jsonBackend) HostDisappeared(ip net.IP, subnet string, mac net.Hardware
 		slog.String("subnet", subnet),
 		slog.String("mac", mac.String()),
 		slog.String("vendor", vendor),
+		slog.Time("last_seen", lastSeen),
+	)
+}
+
+func (j *jsonBackend) HostExpired(ip string, subnet string, lastSeen time.Time) {
+	j.sl.Info("audit",
+		slog.String("event_type", string(EventHostExpired)),
+		slog.String("ip", ip),
+		slog.String("subnet", subnet),
 		slog.Time("last_seen", lastSeen),
 	)
 }
@@ -318,6 +337,7 @@ type noopBackend struct{}
 func (noopBackend) NewHost(net.IP, string, net.HardwareAddr, string, string)                       {}
 func (noopBackend) MACIPChange(net.IP, string, net.HardwareAddr, net.HardwareAddr, string, string) {}
 func (noopBackend) HostDisappeared(net.IP, string, net.HardwareAddr, string, time.Time)            {}
+func (noopBackend) HostExpired(string, string, time.Time)                                          {}
 func (noopBackend) UnauthorizedDevice(net.IP, string, net.HardwareAddr, string)                    {}
 func (noopBackend) DuplicateIP(net.IP, string, net.HardwareAddr, []net.HardwareAddr)               {}
 func (noopBackend) ScanCycleComplete(string, int, time.Duration, []string)                         {}
