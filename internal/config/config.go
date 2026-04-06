@@ -21,6 +21,7 @@ type Config struct {
 	State         StateConfig    `yaml:"state"`          // IMMUTABLE: see StateConfig comment
 	OUIDatabase   string         `yaml:"oui_database"`   // IMMUTABLE
 	Audit         AuditConfig    `yaml:"audit"`          // IMMUTABLE
+	HostTTL       time.Duration  `yaml:"host_ttl"`       // HOT-RELOAD: duration after which unseen hosts are pruned; 0 = use 3× scan_interval default
 }
 
 // TLSConfig holds TLS and mTLS settings for the metrics endpoint.

@@ -214,7 +214,7 @@ func main() {
 	defer func() { _ = auditLogger.Close() }()
 
 	signetCollector := collector.NewSignetCollector(store, prefixes, logger)
-	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger, ouiDB, auditLogger, allowlists)
+	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger, ouiDB, auditLogger, allowlists, effectiveHostTTL(config.ExtractReloadable(cfg)))
 
 	if cfg.TLS.CertFile == "" {
 		logger.Warn("TLS not configured — serving metrics over plaintext HTTP; not recommended for production")
@@ -290,6 +290,7 @@ func main() {
 									sched.ApplyConfig(scanner.ApplyConfigParams{
 										Subnets:    newSubnets,
 										Allowlists: newAllowlists,
+										HostTTL:    effectiveHostTTL(newRC),
 									})
 
 									// Update port scanner with new per-subnet ports.
@@ -380,4 +381,28 @@ func main() {
 	}
 
 	logger.Info("signet-exporter stopped")
+}
+
+// effectiveHostTTL returns the configured HostTTL from a ReloadableConfig, or a
+// default of 3× the minimum scan interval across all subnets if HostTTL is zero.
+// Returns 0 (disabled) only when no subnets are configured.
+func effectiveHostTTL(rc config.ReloadableConfig) time.Duration {
+	if rc.HostTTL > 0 {
+		return rc.HostTTL
+	}
+	// Compute 3× the minimum scan interval as the default TTL.
+	var minInterval time.Duration
+	for _, s := range rc.Subnets {
+		interval := s.ScanInterval
+		if interval == 0 {
+			interval = 60 * time.Second
+		}
+		if minInterval == 0 || interval < minInterval {
+			minInterval = interval
+		}
+	}
+	if minInterval == 0 {
+		return 0
+	}
+	return 3 * minInterval
 }

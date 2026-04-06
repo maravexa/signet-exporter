@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -354,6 +355,34 @@ func (m *MemoryStore) GetScanMeta(_ context.Context, subnet netip.Prefix) ([]Sca
 		}
 	}
 	return result, nil
+}
+
+// PruneStale removes all hosts whose LastSeen is older than ttl.
+// Returns the IPs of removed hosts. Holds the write lock for the full sweep to
+// prevent races with concurrent UpdateHost calls.
+func (m *MemoryStore) PruneStale(ttl time.Duration) ([]string, error) {
+	if ttl <= 0 {
+		return nil, fmt.Errorf("invalid TTL: %v", ttl)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	var removed []string
+	for ip, host := range m.hosts {
+		if IsStale(host.LastSeen, ttl) {
+			removed = append(removed, ip.String())
+			// Clean up macIndex for this host.
+			if len(host.MAC) > 0 {
+				macKey := host.MAC.String()
+				m.macIndex[macKey] = removeAddr(m.macIndex[macKey], ip)
+				if len(m.macIndex[macKey]) == 0 {
+					delete(m.macIndex, macKey)
+				}
+			}
+			delete(m.hosts, ip)
+		}
+	}
+	return removed, nil
 }
 
 // HostCount returns the total number of tracked hosts.

@@ -42,6 +42,12 @@ type Store interface {
 	// Returns an empty slice (not an error) if no metadata has been recorded yet.
 	GetScanMeta(ctx context.Context, subnet netip.Prefix) ([]ScanMeta, error)
 
+	// PruneStale removes hosts not seen within ttl. Returns the list of removed
+	// host IPs so the caller can emit audit events. The state store does not
+	// emit audit events itself — callers decide what to do with removed hosts.
+	// Returns an error if ttl is zero or negative, or if the underlying store fails.
+	PruneStale(ttl time.Duration) ([]string, error)
+
 	// Close releases any resources held by the store.
 	Close() error
 }

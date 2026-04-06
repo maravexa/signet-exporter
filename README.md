@@ -423,6 +423,7 @@ kill -HUP $(pidof signet-exporter)
 | `subnets` — CIDR list, scan intervals | Yes — SIGHUP |
 | `subnets` — TCP ports per subnet | Yes — SIGHUP |
 | `subnets` — MAC allowlist file paths | Yes — SIGHUP |
+| `host_ttl` | Yes — SIGHUP |
 | TLS certificate contents | Yes — SIGHUP (cert rotation) |
 | `listen_address` | **No** — restart required |
 | `tls.*` (paths, min_version) | **No** — restart required |
@@ -444,3 +445,60 @@ kill -HUP $(pidof signet-exporter)
 ### Invalid config handling
 
 If the reloaded config contains an invalid CIDR, out-of-range port, or a missing allowlist file, the reload is rejected entirely — no partial changes are applied. The error is logged at ERROR level and the exporter continues with the previous configuration.
+
+---
+
+## Cardinality and Scaling
+
+### Port scan list guidance
+
+Signet is a network inventory tool, not a vulnerability scanner. The port scan list (`ports` in `signet.yaml`) exists to detect service presence for inventory purposes — knowing that a device is running SSH or HTTP, not enumerating all open ports on every host. Every port in the scan list is a linear multiplier on `signet_port_open` series count: 100 hosts × 20 ports = up to 2,000 `signet_port_open` series. Keep the list to genuinely meaningful service indicators: SSH (22), HTTP/S (80, 443), common management interfaces (161 SNMP, 623 IPMI, 3389 RDP). A 500-port scan list on a /16 will generate millions of series and should be handled by a dedicated port scanner like nmap, not Signet.
+
+### Network size guidance
+
+| Network | Usable hosts | Live hosts (40% fill) | Estimated series (10 ports) | Notes |
+|---|---|---|---|---|
+| /24 | 254 | ~100 | ~600 | Trivially fine |
+| /20 | 4,094 | ~1,600 | ~8K | Fine |
+| /16 | 65,534 | ~26K | ~120K | Fine on standard Prometheus |
+| /14 | 262,142 | ~105K | ~500K | Approaching limits; plan for federation |
+| /12 | 1,048,574 | ~419K | ~2M | Single Prometheus not recommended |
+| /10 and larger | — | — | — | Requires federation or Thanos/Cortex |
+
+The `signet_active_series_estimate` metric in `/metrics` gives a real-time estimate based on actual host count and configured port list, which is more reliable than this table for a specific deployment.
+
+### /14+ deployments
+
+At /14 and larger, plan for Prometheus federation or a horizontally scalable TSDB (Thanos, Cortex, Mimir) from the start. Retrofitting remote storage after a TSDB is already straining is painful. The inflection point is not just series count but scrape cardinality — at /14+, a single Prometheus instance scraping Signet will have its query layer stressed by even simple aggregations. If a /14+ deployment is in scope, this should already be an infrastructure architecture discussion, not a surprise. Signet is designed to be a good federation citizen: all metrics carry `subnet` labels suitable for hierarchical aggregation.
+
+### PromQL join examples for `signet_host_info`
+
+`signet_host_up` carries only `ip` and `subnet` labels. Enrichment metadata (MAC, vendor, hostname) lives on `signet_host_info` (value always 1). Join them in PromQL when you need to filter or group by enrichment labels.
+
+```promql
+# Find all unauthorized devices, with vendor and MAC
+signet_unauthorized_device_detected * on(ip, subnet) group_left(vendor, mac)
+  signet_host_info
+
+# Count live hosts by vendor
+count by (vendor) (
+  signet_host_up * on(ip, subnet) group_left(vendor) signet_host_info
+)
+
+# Alert on hosts with hostname matching a pattern that are down
+signet_host_up == 0
+  * on(ip, subnet) group_left(hostname)
+  signet_host_info{hostname=~"prod-.*"}
+```
+
+### TTL tuning guidance
+
+The default TTL of 3× the scan interval means a host must miss three consecutive scans before being pruned. For most environments this is appropriate — it tolerates transient scan failures (packet loss, host briefly unavailable) without generating false `HostExpired` audit events. In environments with very long scan intervals (>30 minutes), consider setting an explicit `host_ttl` in `signet.yaml` to avoid retaining stale data for hours. In environments where any host disappearance is immediately significant (air-gapped networks with a fixed inventory), tighten the TTL to 1× or 2× the scan interval and treat `HostExpired` audit events as actionable.
+
+```yaml
+# Explicit TTL: 15 minutes regardless of scan interval
+host_ttl: 15m
+
+# Disable TTL eviction entirely (hosts persist until restart)
+host_ttl: 0
+```

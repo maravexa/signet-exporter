@@ -65,6 +65,47 @@ func NewBoltStore(path string) (*BoltStore, error) {
 	return &BoltStore{db: db}, nil
 }
 
+// PruneStale removes all hosts whose LastSeen is older than ttl.
+// Uses a single read-write transaction so the prune is atomic — no concurrent
+// UpdateHost can resurrect a host between the stale check and the delete.
+// Returns the IPs of removed hosts, or an error if ttl is invalid or the transaction fails.
+func (b *BoltStore) PruneStale(ttl time.Duration) ([]string, error) {
+	if ttl <= 0 {
+		return nil, fmt.Errorf("invalid TTL: %v", ttl)
+	}
+	var removed []string
+	err := b.db.Update(func(tx *bolt.Tx) error {
+		hBkt := tx.Bucket(bucketHosts)
+		var staleKeys [][]byte
+		if err := hBkt.ForEach(func(k, v []byte) error {
+			r, rerr := unmarshalHostRecord(v)
+			if rerr != nil {
+				return nil // skip corrupt records
+			}
+			if IsStale(r.LastSeen, ttl) {
+				// Copy key — ForEach keys are only valid inside the callback.
+				keyCopy := make([]byte, len(k))
+				copy(keyCopy, k)
+				staleKeys = append(staleKeys, keyCopy)
+				removed = append(removed, string(k))
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+		for _, k := range staleKeys {
+			if err := hBkt.Delete(k); err != nil {
+				return fmt.Errorf("delete stale host %q: %w", k, err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return removed, nil
+}
+
 // Close closes the underlying bbolt database.
 func (b *BoltStore) Close() error {
 	return b.db.Close()
