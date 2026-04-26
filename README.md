@@ -7,6 +7,8 @@
 
 ---
 
+Most network inventory tools were built for IT operations, not compliance. They assume a CMDB, a change-management process, and a team whose primary concern is uptime — not an auditor asking whether every device on your OT subnet is known and authorized. ARP-level visibility sounds basic, but no existing Prometheus exporter ties raw MAC-to-IP binding data to allowlist enforcement, rogue device detection, and a structured audit trail in a single deployable binary. Signet fills that gap: it brings Layer 2 inventory into your existing Prometheus/Grafana stack with the security controls that compliance environments require — mTLS, FIPS-validated crypto, least-privilege operation, and signed releases with a verifiable SBOM.
+
 ## Security Posture
 
 | Control | Implementation |
