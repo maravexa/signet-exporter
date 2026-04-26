@@ -285,7 +285,7 @@ Kubernetes deployment manifests are planned for a future release. The exporter r
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+MIT [LICENSE](LICENSE).
 
 ---
 
