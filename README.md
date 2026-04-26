@@ -1,5 +1,8 @@
 # signet-exporter
 
+[![CI](https://github.com/maravexa/signet-exporter/actions/workflows/ci.yml/badge.svg)](https://github.com/maravexa/signet-exporter/actions/workflows/ci.yml)
+[![FIPS Validation](https://github.com/maravexa/signet-exporter/actions/workflows/fips.yml/badge.svg)](https://github.com/maravexa/signet-exporter/actions/workflows/fips.yml)
+
 **Prometheus exporter for network inventory observability** — designed for compliance-heavy and air-gapped environments.
 
 ---
