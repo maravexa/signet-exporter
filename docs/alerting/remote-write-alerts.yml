@@ -1,0 +1,79 @@
+# Signet remote write alert rules
+#
+# Drop this file into your Prometheus rules directory (e.g. /etc/prometheus/rules/) or
+# load it into Mimir ruler as a tenant rule group via the ruler API or mimirtool.
+#
+# The runbook_url annotations contain relative paths. Substitute your organization's
+# documentation base URL before deploying (e.g. replace "docs/operations/" with
+# "https://wiki.example.com/signet/").
+#
+# Validate before deploying:
+#   promtool check rules docs/alerting/remote-write-alerts.yml
+
+groups:
+  - name: signet_remote_write
+    rules:
+      - alert: SignetRemoteWriteFailing
+        expr: time() - signet_remote_write_last_success_timestamp > 300
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Signet remote write has not succeeded in 5 minutes"
+          description: >-
+            Signet instance {{ $labels.instance }} endpoint {{ $labels.endpoint }}
+            has not had a successful remote write in over 5 minutes.
+            Pushed metrics are not reaching the receiver.
+          runbook_url: "docs/operations/troubleshooting-remote-write.md"
+
+      - alert: SignetRemoteWriteHighDropRate
+        expr: rate(signet_remote_write_samples_dropped_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Signet is dropping samples for {{ $labels.reason }}"
+          description: >-
+            Signet instance {{ $labels.instance }} is dropping samples
+            (reason: {{ $labels.reason }}) at {{ $value | humanize }} samples/second.
+            This indicates queue saturation, conversion errors, or receiver rejection.
+          runbook_url: "docs/operations/troubleshooting-remote-write.md"
+
+      - alert: SignetRemoteWriteQueueGrowing
+        expr: deriv(signet_remote_write_queue_size[10m]) > 0 and signet_remote_write_queue_size > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Signet remote write queue is growing"
+          description: >-
+            Signet instance {{ $labels.instance }} queue size has been growing for
+            10 minutes. Receiver throughput is below producer rate. Apply cardinality
+            reduction, increase queue capacity, or scale the receiver.
+          runbook_url: "docs/operations/troubleshooting-remote-write.md#5-queue-full-drops"
+
+      - alert: SignetRemoteWriteFatalResponses
+        expr: increase(signet_remote_write_failures_total{reason="4xx"}[1h]) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Signet remote write receiving 4xx responses"
+          description: >-
+            Signet instance {{ $labels.instance }} has received {{ $value }} 4xx responses
+            from {{ $labels.endpoint }} in the last hour. 4xx is a configuration error and
+            is not retried — the receiver is rejecting samples permanently until config is fixed.
+          runbook_url: "docs/operations/troubleshooting-remote-write.md#2-4xx-response-failures-config-error-fail-fast"
+
+      - alert: SignetRemoteWriteEndpointUnreachable
+        expr: rate(signet_remote_write_failures_total{reason=~"5xx|network|timeout"}[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Signet remote write endpoint is unreachable"
+          description: >-
+            Signet instance {{ $labels.instance }} is failing to reach {{ $labels.endpoint }}
+            (reason: {{ $labels.reason }}). This may be transient — Signet retries with
+            exponential backoff. If sustained, check receiver health and network path.
+          runbook_url: "docs/operations/troubleshooting-remote-write.md"
