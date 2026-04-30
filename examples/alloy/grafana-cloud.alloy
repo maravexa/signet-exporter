@@ -1,0 +1,64 @@
+// Alloy forwarding Signet metrics to Grafana Cloud Prometheus.
+//
+// Deploy as: /etc/alloy/config.alloy
+//
+// The basic_auth password file referenced below must be readable only by
+// the Alloy process user. Recommended ownership is `alloy:alloy` with
+// mode 0600. Grafana Cloud's portal labels the credential an "API key" or
+// "Access Policy token", but the wire-format treatment is HTTP basic-auth
+// password.
+//
+// Grafana Cloud enforces per-stack series and ingestion limits. If your
+// Signet deployment is large enough to push against those limits, see
+// cardinality-conscious.alloy in this directory for reduction patterns.
+//
+// See README.md for the decision tree on Alloy vs. native remote write.
+
+prometheus.scrape "signet" {
+	targets = [
+		{"__address__" = "127.0.0.1:9420", "job" = "signet"},
+	]
+
+	metrics_path = "/metrics"
+	scheme       = "https"
+
+	scrape_interval = "60s"
+	scrape_timeout  = "30s"
+
+	tls_config {
+		ca_file   = "/etc/alloy/tls/ca.pem"
+		cert_file = "/etc/alloy/tls/client.pem"
+		key_file  = "/etc/alloy/tls/client-key.pem"
+	}
+
+	forward_to = [prometheus.remote_write.grafana_cloud.receiver]
+}
+
+prometheus.remote_write "grafana_cloud" {
+	endpoint {
+		// Replace with your stack's Prometheus push URL — find it under
+		// "Connections → Hosted Prometheus metrics" in the Grafana Cloud
+		// portal. The XX/REGION-X placeholders vary per stack.
+		url = "https://prometheus-prod-XX-prod-REGION-X.grafana.net/api/prom/push"
+
+		basic_auth {
+			// Numeric instance ID from the Grafana Cloud portal, NOT a
+			// username string. Treat as non-secret but not public.
+			username = "YOUR_INSTANCE_ID"
+
+			// File must be mode 0600, owned by the Alloy process user.
+			// Rotate by replacing the file contents — Alloy re-reads on
+			// each request.
+			password_file = "/etc/alloy/grafana-cloud-token"
+		}
+	}
+
+	// External labels are stamped onto every series before it leaves Alloy.
+	// Signet itself never injects external labels — operators set them
+	// here, explicitly, per the no-magic policy. Pick values that are
+	// stable per-deployment and meaningful to your queries.
+	external_labels = {
+		cluster     = "homelab-1",
+		environment = "production",
+	}
+}
