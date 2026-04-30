@@ -18,6 +18,7 @@ type Server struct {
 	httpServer *http.Server
 	tlsEnabled bool
 	reloader   *tlsutil.KeypairReloader // nil when TLS not configured
+	registry   *prometheus.Registry     // exposed so additional collectors (remote write) can self-register
 }
 
 // NewHandler creates the HTTP handler with /metrics, /health, and /ready endpoints.
@@ -25,7 +26,13 @@ type Server struct {
 func NewHandler(col prometheus.Collector, ready <-chan struct{}) http.Handler {
 	registry := prometheus.NewRegistry()
 	registry.MustRegister(col)
+	return newHandlerForRegistry(registry, ready)
+}
 
+// newHandlerForRegistry builds the mux against an existing registry so that
+// the caller (NewServer) can register additional collectors before requests
+// are served.
+func newHandlerForRegistry(registry *prometheus.Registry, ready <-chan struct{}) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.Handle("/metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{
@@ -57,7 +64,9 @@ func NewHandler(col prometheus.Collector, ready <-chan struct{}) http.Handler {
 // TLS (and optionally mTLS) is configured according to cfg.TLS.
 // If no TLS certificate is configured, the server operates in plaintext HTTP mode.
 func NewServer(cfg *config.Config, col prometheus.Collector, ready <-chan struct{}) (*Server, error) {
-	handler := NewHandler(col, ready)
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(col)
+	handler := newHandlerForRegistry(registry, ready)
 
 	httpSrv := &http.Server{
 		Addr:    cfg.ListenAddress,
@@ -76,8 +85,13 @@ func NewServer(cfg *config.Config, col prometheus.Collector, ready <-chan struct
 		tlsEnabled = true
 	}
 
-	return &Server{httpServer: httpSrv, tlsEnabled: tlsEnabled, reloader: reloader}, nil
+	return &Server{httpServer: httpSrv, tlsEnabled: tlsEnabled, reloader: reloader, registry: registry}, nil
 }
+
+// Registry returns the prometheus.Registry backing the /metrics endpoint so
+// additional collectors (e.g. remote write self-metrics) can register on the
+// same target without standing up a parallel registry.
+func (s *Server) Registry() *prometheus.Registry { return s.registry }
 
 // Start begins serving. Uses HTTPS when TLS is configured, otherwise plain HTTP.
 // Returns http.ErrServerClosed after a successful Shutdown call.

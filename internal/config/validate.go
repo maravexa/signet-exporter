@@ -44,6 +44,12 @@ func Validate(cfg *Config) error {
 		return fmt.Errorf("audit: %w", err)
 	}
 
+	if err := cfg.RemoteWrite.Validate(); err != nil {
+		// Both fatal errors and *ConfigWarning are wrapped; callers that wish
+		// to downgrade warnings can inspect via remotewrite.IsWarning(err).
+		return fmt.Errorf("remote_write: %w", err)
+	}
+
 	return nil
 }
 

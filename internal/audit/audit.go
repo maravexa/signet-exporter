@@ -28,6 +28,13 @@ const (
 	EventScanError          EventType = "scan_error"
 	EventConfigReloaded     EventType = "config_reloaded"
 	EventCertReloaded       EventType = "cert_reloaded"
+
+	// Remote write subsystem events. Logged so compliance auditors can correlate
+	// "metrics were silently failing to push" with the broader incident timeline.
+	EventRemoteWriteStarted             EventType = "remote_write_started"
+	EventRemoteWriteEndpointUnreachable EventType = "remote_write_endpoint_unreachable"
+	EventRemoteWriteConfigReloaded      EventType = "remote_write_config_reloaded"
+	EventRemoteWriteRecovered           EventType = "remote_write_recovered"
 )
 
 // auditBackend is the internal interface all formatters must satisfy.
@@ -44,6 +51,10 @@ type auditBackend interface {
 	ScanError(subnet, scanner string, err error)
 	ConfigReloaded(changedFields []string)
 	CertReloaded(certPath string, certErr error)
+	RemoteWriteStarted(endpoint, authType string)
+	RemoteWriteEndpointUnreachable(endpoint string, downFor time.Duration, lastErr string)
+	RemoteWriteConfigReloaded(changes []string)
+	RemoteWriteRecovered(endpoint string, downFor time.Duration)
 }
 
 // Logger emits structured audit events to the configured backend.
@@ -198,6 +209,33 @@ func (l *Logger) CertReloaded(certPath string, certErr error) {
 	l.backend.CertReloaded(certPath, certErr)
 }
 
+// RemoteWriteStarted logs the first successful push to the remote write endpoint.
+// Emitted once per Sender lifetime — re-establishment after a long outage emits
+// RemoteWriteRecovered instead.
+func (l *Logger) RemoteWriteStarted(endpoint, authType string) {
+	l.backend.RemoteWriteStarted(endpoint, authType)
+}
+
+// RemoteWriteEndpointUnreachable logs that the receiver has been unreachable for
+// downFor — emitted once at the threshold so SIEM rules can latch on a single
+// event rather than rate-limit per-failure logs.
+func (l *Logger) RemoteWriteEndpointUnreachable(endpoint string, downFor time.Duration, lastErr string) {
+	l.backend.RemoteWriteEndpointUnreachable(endpoint, downFor, lastErr)
+}
+
+// RemoteWriteConfigReloaded logs that the remote write subsystem applied a SIGHUP
+// configuration change. Diff summary is the same human-readable list emitted for
+// the broader config_reloaded event.
+func (l *Logger) RemoteWriteConfigReloaded(changes []string) {
+	l.backend.RemoteWriteConfigReloaded(changes)
+}
+
+// RemoteWriteRecovered logs a successful push following a sustained outage,
+// closing the loop opened by RemoteWriteEndpointUnreachable.
+func (l *Logger) RemoteWriteRecovered(endpoint string, downFor time.Duration) {
+	l.backend.RemoteWriteRecovered(endpoint, downFor)
+}
+
 // ---- jsonBackend -----------------------------------------------------------
 
 // jsonBackend writes audit events as JSON lines using slog.
@@ -314,6 +352,38 @@ func (j *jsonBackend) ConfigReloaded(changedFields []string) {
 	)
 }
 
+func (j *jsonBackend) RemoteWriteStarted(endpoint, authType string) {
+	j.sl.Info("audit",
+		slog.String("event_type", string(EventRemoteWriteStarted)),
+		slog.String("endpoint", endpoint),
+		slog.String("auth_type", authType),
+	)
+}
+
+func (j *jsonBackend) RemoteWriteEndpointUnreachable(endpoint string, downFor time.Duration, lastErr string) {
+	j.sl.Warn("audit",
+		slog.String("event_type", string(EventRemoteWriteEndpointUnreachable)),
+		slog.String("endpoint", endpoint),
+		slog.Float64("down_for_seconds", downFor.Seconds()),
+		slog.String("last_error", lastErr),
+	)
+}
+
+func (j *jsonBackend) RemoteWriteConfigReloaded(changes []string) {
+	j.sl.Info("audit",
+		slog.String("event_type", string(EventRemoteWriteConfigReloaded)),
+		slog.Any("changes", changes),
+	)
+}
+
+func (j *jsonBackend) RemoteWriteRecovered(endpoint string, downFor time.Duration) {
+	j.sl.Info("audit",
+		slog.String("event_type", string(EventRemoteWriteRecovered)),
+		slog.String("endpoint", endpoint),
+		slog.Float64("down_for_seconds", downFor.Seconds()),
+	)
+}
+
 func (j *jsonBackend) CertReloaded(certPath string, certErr error) {
 	if certErr != nil {
 		j.sl.Warn("audit",
@@ -345,3 +415,7 @@ func (noopBackend) ScanCompleted(string, string, time.Duration, int)            
 func (noopBackend) ScanError(string, string, error)                                                {}
 func (noopBackend) ConfigReloaded([]string)                                                        {}
 func (noopBackend) CertReloaded(string, error)                                                     {}
+func (noopBackend) RemoteWriteStarted(string, string)                                              {}
+func (noopBackend) RemoteWriteEndpointUnreachable(string, time.Duration, string)                   {}
+func (noopBackend) RemoteWriteConfigReloaded([]string)                                             {}
+func (noopBackend) RemoteWriteRecovered(string, time.Duration)                                     {}

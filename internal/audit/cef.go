@@ -42,6 +42,11 @@ const (
 	cefIDHostDisappeared   = 150
 	cefIDHostExpired       = 160
 	cefIDScanCycleComplete = 550
+
+	cefIDRemoteWriteStarted             = 900
+	cefIDRemoteWriteEndpointUnreachable = 910
+	cefIDRemoteWriteConfigReloaded      = 920
+	cefIDRemoteWriteRecovered           = 930
 )
 
 // cefEscapeHeader escapes characters that are significant in CEF header fields
@@ -190,6 +195,38 @@ func (c *CEFFormatter) ScanError(subnet, scanner string, err error) {
 func (c *CEFFormatter) ConfigReloaded(changedFields []string) {
 	c.writeLine(cefIDConfigReloaded, "Configuration Reloaded", 2, ext(
 		"changedFields", strings.Join(changedFields, ","),
+	))
+}
+
+// RemoteWriteStarted logs the first successful push to the remote write endpoint.
+func (c *CEFFormatter) RemoteWriteStarted(endpoint, authType string) {
+	c.writeLine(cefIDRemoteWriteStarted, "Remote Write Started", 2, ext(
+		"endpoint", endpoint,
+		"authType", authType,
+	))
+}
+
+// RemoteWriteEndpointUnreachable logs a sustained-failure threshold crossing.
+func (c *CEFFormatter) RemoteWriteEndpointUnreachable(endpoint string, downFor time.Duration, lastErr string) {
+	c.writeLine(cefIDRemoteWriteEndpointUnreachable, "Remote Write Endpoint Unreachable", 7, ext(
+		"endpoint", endpoint,
+		"downForMs", fmt.Sprintf("%d", downFor.Milliseconds()),
+		"msg", lastErr,
+	))
+}
+
+// RemoteWriteConfigReloaded logs a SIGHUP-driven remote-write configuration change.
+func (c *CEFFormatter) RemoteWriteConfigReloaded(changes []string) {
+	c.writeLine(cefIDRemoteWriteConfigReloaded, "Remote Write Config Reloaded", 2, ext(
+		"changes", strings.Join(changes, ","),
+	))
+}
+
+// RemoteWriteRecovered logs the first success following a sustained outage.
+func (c *CEFFormatter) RemoteWriteRecovered(endpoint string, downFor time.Duration) {
+	c.writeLine(cefIDRemoteWriteRecovered, "Remote Write Recovered", 2, ext(
+		"endpoint", endpoint,
+		"downForMs", fmt.Sprintf("%d", downFor.Milliseconds()),
 	))
 }
 
