@@ -1,0 +1,52 @@
+// Minimal Alloy → Signet → remote write configuration.
+//
+// Deploy as: /etc/alloy/config.alloy
+//
+// mTLS paths assume Signet's default /etc/signet/tls/ layout, exposed to
+// the Alloy host via volume mount, bind mount, or an out-of-band copy.
+// Alloy reads its copies from /etc/alloy/tls/ — keep the two namespaces
+// distinct so a future Signet rotation doesn't accidentally invalidate
+// Alloy's client identity.
+//
+// See README.md in this directory for deployment guidance and the
+// decision tree for "Alloy vs. native remote write".
+
+prometheus.scrape "signet" {
+	// Static target list — service discovery is intentionally out of scope
+	// for these examples. See upstream Alloy docs for discovery.* components.
+	targets = [
+		{"__address__" = "127.0.0.1:9420", "job" = "signet"},
+	]
+
+	metrics_path = "/metrics"
+	scheme       = "https"
+
+	// 60s matches Signet's typical scan cadence. Scraping faster than the
+	// scan interval just re-reads cached state and adds no fidelity.
+	scrape_interval = "60s"
+	scrape_timeout  = "30s"
+
+	// mTLS to Signet. The CA here must be the same CA that signed Signet's
+	// server cert; the client cert must be signed by Signet's
+	// tls.client_ca_file CA.
+	tls_config {
+		ca_file   = "/etc/alloy/tls/ca.pem"
+		cert_file = "/etc/alloy/tls/client.pem"
+		key_file  = "/etc/alloy/tls/client-key.pem"
+	}
+
+	forward_to = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+	endpoint {
+		// Placeholder. Substitute the real remote write URL for your TSDB
+		// (Mimir, Cortex, Thanos receive, VictoriaMetrics, etc.).
+		url = "https://prometheus.example.com/api/v1/push"
+
+		// No auth in this example — production deployments should add
+		// either a tls_config block (mTLS) or a basic_auth / authorization
+		// block. See grafana-cloud.alloy and mimir-self-hosted.alloy for
+		// worked examples.
+	}
+}

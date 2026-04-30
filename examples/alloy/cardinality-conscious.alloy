@@ -1,0 +1,162 @@
+// Cardinality-conscious Alloy configuration for large Signet deployments.
+//
+// Deploy as: /etc/alloy/config.alloy
+//
+// Two reduction patterns are demonstrated below, both tied directly to
+// Signet's metric model. They are independent — apply either, both, or
+// neither depending on what your deployment can tolerate. See the
+// "Cardinality and Scaling" section of the main Signet README for the
+// underlying series-volume math and inflection points.
+//
+// Honest disclaimer: these patterns trade observability for series
+// volume. Pattern 1 deletes a metric outright; pattern 2 staggers
+// freshness. Measure first — `signet_active_series_estimate` reports
+// real-time series volume — before applying either pattern in production.
+
+// =============================================================================
+// PATTERN 1 — Drop signet_port_open entirely.
+// =============================================================================
+//
+// signet_port_open carries one series per (host, port, subnet) tuple, so
+// its cardinality scales as O(hosts × ports). Operators who only need
+// host inventory — not service-presence — can drop the metric at the
+// Alloy boundary and never ship it to the TSDB.
+//
+// Worked example: 1024 hosts × 20 ports = 20,480 series eliminated.
+// Larger deployments scale proportionally; a /16 with a 10-port scan list
+// drops on the order of 250K series.
+//
+// If you need port-presence for a subset of hosts, prefer narrowing the
+// `ports` list in signet.yaml over dropping the metric here — Signet's
+// own configuration already documents that the port list is a linear
+// cardinality multiplier.
+
+prometheus.relabel "drop_port_open" {
+	forward_to = [prometheus.remote_write.default.receiver]
+
+	rule {
+		source_labels = ["__name__"]
+		regex         = "signet_port_open"
+		action        = "drop"
+	}
+}
+
+// =============================================================================
+// PATTERN 2 — Stagger scrape frequency by metric.
+// =============================================================================
+//
+// signet_host_info carries the high-churn `hostname` and `vendor`
+// enrichment labels (see the README PromQL join examples). Operators who
+// query host_info via PromQL joins can tolerate a stale-by-up-to-5-min
+// enrichment view because the underlying enrichment data — DNS PTR
+// records, OUI mappings — changes far slower than that.
+//
+// Splitting the scrape lets the frequently-queried health metrics stay
+// fresh while halving (or better) the ingestion volume of the enrichment
+// metric. Series-volume-at-rest is unchanged; the savings are in samples
+// per second.
+//
+// signet_fast keeps:
+//   - signet_host_up                      (liveness)
+//   - signet_subnet_addresses_used        (utilization)
+//   - signet_subnet_addresses_total       (capacity)
+//   - signet_scan_duration_seconds        (health)
+//   - signet_scan_errors_total            (health)
+//   - signet_last_scan_timestamp          (freshness)
+//
+// signet_slow keeps:
+//   - signet_host_info                    (enrichment join target)
+
+prometheus.scrape "signet_fast" {
+	targets = [
+		{"__address__" = "127.0.0.1:9420", "job" = "signet"},
+	]
+
+	metrics_path = "/metrics"
+	scheme       = "https"
+
+	scrape_interval = "60s"
+	scrape_timeout  = "30s"
+
+	tls_config {
+		ca_file   = "/etc/alloy/tls/ca.pem"
+		cert_file = "/etc/alloy/tls/client.pem"
+		key_file  = "/etc/alloy/tls/client-key.pem"
+	}
+
+	// Pipeline: signet_fast → keep_fast_metrics → drop_port_open → remote_write.
+	// Routing through drop_port_open is belt-and-suspenders — the keep
+	// filter below already excludes signet_port_open — but keeping the
+	// component wired makes Pattern 1 trivially reusable if an operator
+	// later loosens the keep regex.
+	forward_to = [prometheus.relabel.keep_fast_metrics.receiver]
+}
+
+prometheus.scrape "signet_slow" {
+	targets = [
+		{"__address__" = "127.0.0.1:9420", "job" = "signet"},
+	]
+
+	metrics_path = "/metrics"
+	scheme       = "https"
+
+	// 5x slower than the fast scrape — enrichment data churns slowly.
+	scrape_interval = "5m"
+	scrape_timeout  = "30s"
+
+	tls_config {
+		ca_file   = "/etc/alloy/tls/ca.pem"
+		cert_file = "/etc/alloy/tls/client.pem"
+		key_file  = "/etc/alloy/tls/client-key.pem"
+	}
+
+	forward_to = [prometheus.relabel.keep_host_info.receiver]
+}
+
+// Fast-path filter: keep only the metrics queried for health and
+// utilization. Everything else (including signet_host_info, which is
+// captured by signet_slow) is dropped.
+prometheus.relabel "keep_fast_metrics" {
+	forward_to = [prometheus.relabel.drop_port_open.receiver]
+
+	rule {
+		source_labels = ["__name__"]
+		regex         = "signet_host_up|signet_subnet_.*|signet_scan_.*|signet_last_scan_timestamp"
+		action        = "keep"
+	}
+}
+
+// Slow-path filter: keep only signet_host_info from this scrape.
+prometheus.relabel "keep_host_info" {
+	forward_to = [prometheus.remote_write.default.receiver]
+
+	rule {
+		source_labels = ["__name__"]
+		regex         = "signet_host_info"
+		action        = "keep"
+	}
+}
+
+// =============================================================================
+// Remote write target.
+// =============================================================================
+
+prometheus.remote_write "default" {
+	endpoint {
+		url = "https://prometheus.example.com/api/v1/push"
+
+		tls_config {
+			ca_file   = "/etc/alloy/tls/backend/ca.pem"
+			cert_file = "/etc/alloy/tls/backend/client.pem"
+			key_file  = "/etc/alloy/tls/backend/client-key.pem"
+		}
+	}
+
+	// External labels are mandatory for cross-cluster query disambiguation
+	// at the scale where these patterns matter. Set values that match how
+	// your Grafana data sources slice the data.
+	external_labels = {
+		cluster     = "homelab-1",
+		environment = "production",
+	}
+}

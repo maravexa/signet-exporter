@@ -375,6 +375,14 @@ If the new files are invalid, the old certificate remains active and an error is
 
 ---
 
+## Integrations
+
+Operators already running Grafana Alloy should scrape Signet with Alloy rather than enabling native remote write. This avoids running two metrics-shipping pipelines for the same data and lets operators reuse Alloy's relabeling, fan-out, and service discovery. Native remote write remains the recommended path for air-gapped deployments, single-binary compliance constraints, and environments where qualifying a second binary is non-trivial.
+
+Working configurations live in [`examples/alloy/`](examples/alloy/) — minimal scrape, Grafana Cloud, self-hosted Mimir, and a `cardinality-conscious.alloy` reference for large deployments that demonstrates the two series-reduction patterns tied to Signet's metric model. See [`examples/alloy/README.md`](examples/alloy/README.md) for the decision tree, deployment walkthroughs, and the Alloy-side mTLS configuration.
+
+---
+
 ## Grafana Dashboard
 
 A pre-built Grafana dashboard is included in [`grafana/signet-overview.json`](grafana/signet-overview.json).

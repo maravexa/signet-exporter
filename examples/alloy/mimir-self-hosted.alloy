@@ -1,0 +1,69 @@
+// Alloy forwarding Signet metrics to a self-hosted Mimir cluster with
+// mTLS and tenant scoping.
+//
+// Deploy as: /etc/alloy/config.alloy
+//
+// The X-Scope-OrgID header is REQUIRED when the Mimir cluster is started
+// with auth_enabled: true (the default for multi-tenant deployments).
+// Single-tenant Mimir deployments running with auth_enabled: false should
+// remove the headers block entirely — Mimir will reject requests carrying
+// the header in that mode.
+//
+// See upstream Mimir documentation for tenant lifecycle, per-tenant
+// limits, and how X-Scope-OrgID maps to ingester sharding:
+//   https://grafana.com/docs/mimir/latest/configure/about-tenant-ids/
+//
+// See README.md for the decision tree on Alloy vs. native remote write.
+
+prometheus.scrape "signet" {
+	targets = [
+		{"__address__" = "127.0.0.1:9420", "job" = "signet"},
+	]
+
+	metrics_path = "/metrics"
+	scheme       = "https"
+
+	scrape_interval = "60s"
+	scrape_timeout  = "30s"
+
+	tls_config {
+		ca_file   = "/etc/alloy/tls/ca.pem"
+		cert_file = "/etc/alloy/tls/client.pem"
+		key_file  = "/etc/alloy/tls/client-key.pem"
+	}
+
+	forward_to = [prometheus.remote_write.mimir.receiver]
+}
+
+prometheus.remote_write "mimir" {
+	endpoint {
+		url = "https://mimir.internal.example.com/api/v1/push"
+
+		// mTLS to Mimir. These paths are deliberately separate from
+		// Signet's TLS material — the Alloy → Mimir trust chain is
+		// independent of the Signet → Alloy trust chain. Sharing CAs is
+		// possible but not required, and operationally cleaner to keep
+		// them separate.
+		tls_config {
+			ca_file   = "/etc/alloy/tls/mimir/ca.pem"
+			cert_file = "/etc/alloy/tls/mimir/client.pem"
+			key_file  = "/etc/alloy/tls/mimir/client-key.pem"
+		}
+
+		// Tenant scoping. Required when Mimir runs with auth_enabled:
+		// true. Remove this block for single-tenant deployments.
+		headers = {
+			"X-Scope-OrgID" = "tenant-a",
+		}
+	}
+
+	// External labels stamped on every series. The `tenant` label here is
+	// for query-time filtering inside Mimir; it is independent of the
+	// X-Scope-OrgID routing header and useful when one Grafana data
+	// source spans multiple tenants via promxy or similar.
+	external_labels = {
+		cluster     = "homelab-1",
+		tenant      = "tenant-a",
+		environment = "production",
+	}
+}
