@@ -383,6 +383,16 @@ Working configurations live in [`examples/alloy/`](examples/alloy/) — minimal 
 
 ---
 
+## Documentation
+
+Operational reference material lives under `docs/`. The most useful entry points for new operators are `docs/operations/push-mode.md` for choosing between scrape and push modes, and `docs/operations/troubleshooting-remote-write.md` for diagnosing failed pushes.
+
+- **Operations:** [`docs/operations/`](docs/operations/) — push-mode decision guide, FIPS coverage, mTLS, cardinality, scaling
+- **Alerting:** [`docs/alerting/`](docs/alerting/) — Prometheus alert rules for remote write self-metrics
+- **Examples:** [`examples/alloy/`](examples/alloy/) — working Alloy integration configurations
+
+---
+
 ## Grafana Dashboard
 
 A pre-built Grafana dashboard is included in [`grafana/signet-overview.json`](grafana/signet-overview.json).
