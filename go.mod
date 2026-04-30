@@ -3,6 +3,7 @@ module github.com/maravexa/signet-exporter
 go 1.22
 
 require (
+	github.com/golang/snappy v0.0.4
 	github.com/mdlayher/packet v1.1.2
 	github.com/prometheus/client_golang v1.19.1
 	github.com/prometheus/client_model v0.6.1

@@ -18,6 +18,7 @@ import (
 	"github.com/maravexa/signet-exporter/internal/config"
 	"github.com/maravexa/signet-exporter/internal/fips"
 	"github.com/maravexa/signet-exporter/internal/oui"
+	"github.com/maravexa/signet-exporter/internal/remotewrite"
 	"github.com/maravexa/signet-exporter/internal/scanner"
 	"github.com/maravexa/signet-exporter/internal/server"
 	"github.com/maravexa/signet-exporter/internal/state"
@@ -94,8 +95,14 @@ func main() {
 	}
 
 	if err := config.Validate(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "configuration invalid: %v\n", err)
-		os.Exit(1)
+		// auth=none over https returns a *ConfigWarning. Surface it but do not
+		// refuse to start — operators may legitimately terminate TLS upstream.
+		if remotewrite.IsWarning(err) {
+			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "configuration invalid: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if *validateOnly {
@@ -229,6 +236,29 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	// Optional remote write push pipeline. Coexists with the /metrics scrape
+	// endpoint — operators in mixed environments may push to a long-term store
+	// while still allowing on-demand scraping for debugging.
+	var rwSender *remotewrite.Sender
+	if cfg.RemoteWrite.Enabled {
+		rwMetrics := remotewrite.NewMetrics()
+		if rerr := rwMetrics.Register(srv.Registry()); rerr != nil {
+			logger.Error("failed to register remote write metrics", "err", rerr)
+			os.Exit(1)
+		}
+		rwSender, err = remotewrite.NewSender(cfg.RemoteWrite, srv.Registry(), rwMetrics, logger, auditLogger, version.Version)
+		if err != nil {
+			logger.Error("failed to initialize remote write sender", "err", err)
+			os.Exit(1)
+		}
+		go func() {
+			if rerr := rwSender.Run(ctx); rerr != nil && ctx.Err() == nil {
+				logger.Error("remote write sender exited unexpectedly", "err", rerr)
+			}
+		}()
+		logger.Info("remote write enabled", "endpoint", cfg.RemoteWrite.Endpoint, "auth_type", cfg.RemoteWrite.Auth.Type)
+	}
+
 	// Track the current reloadable config for diffing on subsequent reloads.
 	currentRC := config.ExtractReloadable(cfg)
 
@@ -329,6 +359,26 @@ func main() {
 							logger.Error("TLS certificate reload failed", "err", reloadErr)
 						} else {
 							logger.Info("TLS certificate reloaded successfully")
+						}
+					}
+
+					// --- Remote write hot-reload ---
+					if rwSender != nil {
+						newCfg, cfgErr := config.LoadConfig(*configPath)
+						if cfgErr == nil {
+							if vErr := newCfg.RemoteWrite.Validate(); vErr != nil && !remotewrite.IsWarning(vErr) {
+								logger.Error("SIGHUP: remote_write config invalid — keeping old config", "err", vErr)
+							} else if rerr := rwSender.Reload(newCfg.RemoteWrite); rerr != nil {
+								if rerr == remotewrite.ErrEnableToggleRequiresRestart {
+									logger.Warn("SIGHUP: remote_write enable toggle ignored — restart required",
+										"old", cfg.RemoteWrite.Enabled, "new", newCfg.RemoteWrite.Enabled)
+								} else {
+									logger.Error("SIGHUP: remote_write reload failed", "err", rerr)
+								}
+							} else {
+								// Track the cfg for the next reload's audit-log diff context.
+								cfg.RemoteWrite = newCfg.RemoteWrite
+							}
 						}
 					}
 				}

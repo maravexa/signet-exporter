@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/maravexa/signet-exporter/internal/remotewrite"
 )
 
 // Config is the top-level configuration structure for signet-exporter.
@@ -22,6 +24,11 @@ type Config struct {
 	OUIDatabase   string         `yaml:"oui_database"`   // IMMUTABLE
 	Audit         AuditConfig    `yaml:"audit"`          // IMMUTABLE
 	HostTTL       time.Duration  `yaml:"host_ttl"`       // HOT-RELOAD: duration after which unseen hosts are pruned; 0 = use 3× scan_interval default
+	// RemoteWrite is the optional Prometheus remote-write push pipeline. Disabled
+	// by default — enabling it does NOT replace the /metrics scrape endpoint, both
+	// can coexist. Endpoint, auth credentials, queue size, and external labels
+	// are operator-controlled. mTLS is the default authentication mode.
+	RemoteWrite remotewrite.Config `yaml:"remote_write"`
 }
 
 // TLSConfig holds TLS and mTLS settings for the metrics endpoint.
@@ -104,6 +111,7 @@ func DefaultConfig() *Config {
 			Enabled: true,
 			Output:  "stderr",
 		},
+		RemoteWrite: remotewrite.DefaultConfig(),
 	}
 }
 
