@@ -2,10 +2,13 @@ package scanner
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"net"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -77,7 +80,30 @@ func (a *Allowlist) Contains(mac net.HardwareAddr) bool {
 
 // Len returns the number of entries in the allowlist.
 func (a *Allowlist) Len() int {
+	if a == nil {
+		return 0
+	}
 	return len(a.macs)
+}
+
+// Scope returns a stable identity for this allowlist's normalized membership.
+// It is used to distinguish authorization evaluations performed against a
+// changed policy without tying persisted state to a machine-local file path.
+func (a *Allowlist) Scope() string {
+	if a == nil {
+		return ""
+	}
+	entries := make([]string, 0, len(a.macs))
+	for mac := range a.macs {
+		entries = append(entries, mac)
+	}
+	sort.Strings(entries)
+	h := sha256.New()
+	for _, mac := range entries {
+		_, _ = h.Write([]byte(mac))
+		_, _ = h.Write([]byte{'\n'})
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // normalizeMAC converts any common MAC format to uppercase colon-separated.

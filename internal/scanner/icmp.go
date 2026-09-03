@@ -64,14 +64,18 @@ func (s *ICMPScanner) Scan(ctx context.Context, subnet netip.Prefix) ([]ScanResu
 	// from other concurrent ping processes are filtered out.
 	icmpID := os.Getpid() & 0xffff
 
-	// Buffer the results channel at min(SubnetSize, 256) to avoid blocking the
-	// listener goroutine while we drain after the scan.
-	sz := netutil.SubnetSize(subnet)
-	bufSize := 256
-	if sz < 256 {
-		bufSize = int(sz)
-	}
-	results := make(chan ScanResult, bufSize)
+	// Drain replies as they arrive. The previous fixed-size channel was drained
+	// only after capture ended, so it silently discarded valid hosts after 256
+	// replies. Blocking briefly under load is safer than reporting an incomplete
+	// scan as successful.
+	results := make(chan ScanResult)
+	var collectorWG sync.WaitGroup
+	var out []ScanResult
+	collectorWG.Add(1)
+	go func() {
+		defer collectorWG.Done()
+		out = collectUniqueICMPReplies(results)
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -117,8 +121,21 @@ sendLoop:
 	// Closing the connection unblocks the listener's ReadFrom, causing it to exit.
 	_ = conn.Close()
 	wg.Wait()
+	collectorWG.Wait()
 
-	// Deduplicate by IP — keep the first response.
+	// A cancelled sweep has incomplete coverage. Return the cancellation error
+	// without partial discovery observations so callers do not persist a result
+	// that looks like a normal completed scan.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// collectUniqueICMPReplies drains replies until closed and deduplicates by IP,
+// retaining the first response. Keeping collection separate from capture makes
+// the no-truncation behavior directly testable.
+func collectUniqueICMPReplies(results <-chan ScanResult) []ScanResult {
 	seen := make(map[netip.Addr]bool)
 	var out []ScanResult
 	for r := range results {
@@ -127,7 +144,7 @@ sendLoop:
 			out = append(out, r)
 		}
 	}
-	return out, nil
+	return out
 }
 
 // listenForReplies reads ICMP echo reply packets from conn until it is closed
@@ -155,8 +172,6 @@ func (s *ICMPScanner) listenForReplies(ctx context.Context, conn *icmp.PacketCon
 		case results <- result:
 		case <-ctx.Done():
 			return
-		default:
-			// Buffer full — drop duplicate reply rather than blocking.
 		}
 	}
 }

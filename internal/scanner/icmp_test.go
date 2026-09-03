@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
@@ -151,6 +152,26 @@ func TestParseEchoReply_TooShort(t *testing.T) {
 	_, ok := parseEchoReply([]byte{0x00, 0x01}, src, 1)
 	if ok {
 		t.Error("parseEchoReply returned ok=true for 2-byte buffer, want false")
+	}
+}
+
+func TestCollectUniqueICMPReplies_DoesNotTruncateLargeReplyStream(t *testing.T) {
+	const hosts = 300
+	ch := make(chan ScanResult)
+	done := make(chan []ScanResult, 1)
+	go func() { done <- collectUniqueICMPReplies(ch) }()
+
+	for i := 0; i < hosts; i++ {
+		ch <- ScanResult{
+			IP:        netip.AddrFrom4([4]byte{10, 30, byte(i / 254), byte(i%254 + 1)}),
+			Timestamp: time.Now(),
+		}
+	}
+	close(ch)
+
+	got := <-done
+	if len(got) != hosts {
+		t.Fatalf("collected %d hosts, want %d; replies must not be silently truncated", len(got), hosts)
 	}
 }
 

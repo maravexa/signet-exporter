@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -138,6 +139,19 @@ func TestNewLogger_FileNotCreatable(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error for unwritable path, got nil")
+	}
+}
+
+func TestNewLogger_RejectsWorldReadableExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.log")
+	if err := os.WriteFile(path, []byte("old record\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := audit.NewLogger(audit.Config{Enabled: true, Output: path}); err == nil {
+		t.Fatal("world-readable audit log was accepted")
 	}
 }
 
@@ -309,6 +323,35 @@ func TestMultipleEvents_OneLine_Each(t *testing.T) {
 		var m map[string]any
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			t.Errorf("line %d is not valid JSON: %v\nraw: %q", i+1, err, line)
+		}
+	}
+}
+
+func TestLogger_ConcurrentWritesRemainVisibleJSONLines(t *testing.T) {
+	var buf bytes.Buffer
+	l := audit.NewLoggerForTest(&buf)
+	ip := net.ParseIP("10.0.0.1")
+	mac, _ := net.ParseMAC("dc:a6:32:00:00:01")
+
+	const events = 100
+	var wg sync.WaitGroup
+	for i := 0; i < events; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l.NewHost(ip, "10.0.0.0/24", mac, "Raspberry Pi", "pi.local")
+		}()
+	}
+	wg.Wait()
+
+	lines := strings.Split(strings.TrimRight(buf.String(), "\n"), "\n")
+	if len(lines) != events {
+		t.Fatalf("got %d audit lines, want %d", len(lines), events)
+	}
+	for i, line := range lines {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Errorf("line %d is not valid JSON: %v", i, err)
 		}
 	}
 }

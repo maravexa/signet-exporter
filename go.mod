@@ -9,6 +9,7 @@ require (
 	github.com/prometheus/client_model v0.6.1
 	go.etcd.io/bbolt v1.3.10
 	golang.org/x/net v0.26.0
+	google.golang.org/protobuf v1.34.2
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -23,5 +24,4 @@ require (
 	github.com/prometheus/procfs v0.15.1 // indirect
 	golang.org/x/sync v0.7.0 // indirect
 	golang.org/x/sys v0.21.0 // indirect
-	google.golang.org/protobuf v1.34.2 // indirect
 )

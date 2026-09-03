@@ -2,6 +2,9 @@
 
 signet-exporter emits structured audit records for security-relevant network events.
 Records can be written in JSON (default) or CEF (Common Event Format) for SIEM integration.
+File output is created with mode `0640`; an existing target must be a regular,
+non-symlink file with no permissions for "other" users. Group read access
+remains supported for the `signet` service group.
 
 ## Configuration
 
@@ -99,9 +102,10 @@ Severity is a numeric value 0–10 per the CEF specification:
 | `event_type` | CEF ID | CEF Severity | Description |
 |---|---|---|---|
 | `new_host_discovered` | 100 | 3 | A host was seen for the first time |
-| `host_disappeared` | 150 | 3 | A previously seen host became stale |
+| `host_disappeared` | 150 | 3 | Reserved for an explicit absence-confirmation policy; not currently emitted |
+| `host_expired` | 160 | 3 | A host was removed by the configured TTL; its pre-delete last-seen timestamp is recorded |
 | `mac_ip_change` | 200 | 7 | An IP address changed its MAC binding |
-| `unauthorized_device` | 300 | 9 | A host's MAC is not on the allowlist |
+| `unauthorized_device` | 300 | 9 | A host's MAC is not on the inventory/compliance allowlist (not network-access authentication) |
 | `duplicate_ip_detected` | 400 | 7 | Multiple MACs are claiming the same IP |
 | `scan_completed` | 500 | 0 | A single scanner pass finished |
 | `scan_cycle_complete` | 550 | 0 | All scanners completed for a subnet |

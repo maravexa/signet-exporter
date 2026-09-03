@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"time"
 
@@ -23,7 +24,11 @@ type Config struct {
 	State         StateConfig    `yaml:"state"`          // IMMUTABLE: see StateConfig comment
 	OUIDatabase   string         `yaml:"oui_database"`   // IMMUTABLE
 	Audit         AuditConfig    `yaml:"audit"`          // IMMUTABLE
-	HostTTL       time.Duration  `yaml:"host_ttl"`       // HOT-RELOAD: duration after which unseen hosts are pruned; 0 = use 3× scan_interval default
+	HostTTL       time.Duration  `yaml:"host_ttl"`       // HOT-RELOAD: explicit 0 disables eviction; omission uses the default
+	// HostTTLSet distinguishes an omitted host_ttl (use the conservative default)
+	// from an explicitly configured host_ttl: 0 (disable TTL eviction). It is
+	// populated by LoadConfig and deliberately not serialized to YAML.
+	HostTTLSet bool `yaml:"-"`
 	// RemoteWrite is the optional Prometheus remote-write push pipeline. Disabled
 	// by default — enabling it does NOT replace the /metrics scrape endpoint, both
 	// can coexist. Endpoint, auth credentials, queue size, and external labels
@@ -116,21 +121,47 @@ func DefaultConfig() *Config {
 }
 
 // LoadConfig reads and parses a YAML configuration file at path.
-// It starts from DefaultConfig and overlays the file values.
+// It starts from DefaultConfig and overlays the file values. It also records
+// whether host_ttl was explicitly configured so an explicit zero remains
+// distinguishable from an omitted value.
 func LoadConfig(path string) (*Config, error) {
 	cfg := DefaultConfig()
 
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = f.Close() }()
 
-	dec := yaml.NewDecoder(f)
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(cfg); err != nil {
 		return nil, err
 	}
 
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		return nil, err
+	}
+	cfg.HostTTLSet = yamlTopLevelFieldPresent(&root, "host_ttl")
+
 	return cfg, nil
+}
+
+// yamlTopLevelFieldPresent reports whether a YAML document's top-level mapping
+// explicitly contains key. This retains the semantic difference between an
+// omitted scalar and an explicit zero value after unmarshalling.
+func yamlTopLevelFieldPresent(root *yaml.Node, key string) bool {
+	if root == nil || len(root.Content) == 0 {
+		return false
+	}
+	mapping := root.Content[0]
+	if mapping.Kind != yaml.MappingNode {
+		return false
+	}
+	for i := 0; i+1 < len(mapping.Content); i += 2 {
+		if mapping.Content[i].Value == key {
+			return true
+		}
+	}
+	return false
 }

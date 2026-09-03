@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync/atomic"
+	"time"
 )
 
 // AEADCipherSuites lists the TLS 1.2 cipher suites permitted by signet.
@@ -102,8 +103,31 @@ func (kr *KeypairReloader) Reload() error {
 	if err != nil {
 		return fmt.Errorf("reload keypair %q + %q: %w", kr.certPath, kr.keyPath, err)
 	}
+	leaf, err := leafCertificate(cert)
+	if err != nil {
+		return fmt.Errorf("reload keypair %q + %q: %w", kr.certPath, kr.keyPath, err)
+	}
+	now := time.Now()
+	if now.Before(leaf.NotBefore) {
+		return fmt.Errorf("reload keypair %q + %q: replacement certificate is not valid before %s", kr.certPath, kr.keyPath, leaf.NotBefore.UTC().Format(time.RFC3339))
+	}
+	if !now.Before(leaf.NotAfter) {
+		return fmt.Errorf("reload keypair %q + %q: replacement certificate expired at %s", kr.certPath, kr.keyPath, leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
+	cert.Leaf = leaf
 	kr.cert.Store(&cert)
 	return nil
+}
+
+func leafCertificate(cert tls.Certificate) (*x509.Certificate, error) {
+	if len(cert.Certificate) == 0 {
+		return nil, fmt.Errorf("keypair contains no certificates")
+	}
+	leaf, err := x509.ParseCertificate(cert.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("parse leaf certificate: %w", err)
+	}
+	return leaf, nil
 }
 
 // GetCertificate is the callback for tls.Config.GetCertificate.

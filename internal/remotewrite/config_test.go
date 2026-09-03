@@ -43,7 +43,7 @@ func TestValidate_EndpointSchemeMustBeHTTP(t *testing.T) {
 func TestValidate_TimeoutMustBeLessThanInterval(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Enabled = true
-	cfg.Endpoint = "http://example.com"
+	cfg.Endpoint = "https://example.com"
 	cfg.Auth = AuthConfig{Type: "none"}
 	cfg.Interval = 10 * time.Second
 	cfg.Timeout = 30 * time.Second
@@ -79,7 +79,7 @@ func TestValidate_BearerRequiresFile(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.Enabled = true
-	cfg.Endpoint = "http://example.com"
+	cfg.Endpoint = "https://example.com"
 	cfg.Auth = AuthConfig{Type: "bearer", BearerTokenFile: tokenPath}
 	if err := cfg.Validate(); err != nil {
 		t.Errorf("valid bearer config: %v", err)
@@ -125,13 +125,38 @@ func TestValidate_AuthNoneOverHTTPS_IsWarning(t *testing.T) {
 	}
 }
 
-func TestValidate_AuthNoneOverHTTPIsClean(t *testing.T) {
+func TestValidate_AuthNoneOverHTTPIsWarning(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Enabled = true
 	cfg.Endpoint = "http://example.com"
 	cfg.Auth = AuthConfig{Type: "none"}
-	if err := cfg.Validate(); err != nil {
-		t.Errorf("auth=none over http should be clean, got: %v", err)
+	if err := cfg.Validate(); !IsWarning(err) {
+		t.Errorf("auth=none over http should warn, got: %v", err)
+	}
+}
+
+func TestValidate_CredentialAuthRequiresHTTPS(t *testing.T) {
+	dir := t.TempDir()
+	ca := writeFile(t, dir, "ca.pem", "x")
+	cert := writeFile(t, dir, "cert.pem", "x")
+	key := writeFile(t, dir, "key.pem", "x")
+	token := writeFile(t, dir, "token", "x")
+	password := writeFile(t, dir, "password", "x")
+
+	for name, auth := range map[string]AuthConfig{
+		"mtls":   {Type: "mtls", CACertFile: ca, ClientCertFile: cert, ClientKeyFile: key},
+		"bearer": {Type: "bearer", BearerTokenFile: token},
+		"basic":  {Type: "basic", BasicUsername: "signet", BasicPasswordFile: password},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Enabled = true
+			cfg.Endpoint = "http://example.com/api/v1/write"
+			cfg.Auth = auth
+			if err := cfg.Validate(); err == nil || IsWarning(err) {
+				t.Fatalf("%s over http = %v, want fatal error", name, err)
+			}
+		})
 	}
 }
 

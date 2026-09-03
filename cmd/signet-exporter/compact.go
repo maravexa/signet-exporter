@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -29,18 +30,43 @@ func CompactDB(dbPath string) error {
 		return fmt.Errorf("open source db (is the exporter still running?): %w", err)
 	}
 
-	tmpPath := dbPath + ".compact.tmp"
-	dst, err := os.Create(tmpPath) //nolint:gosec // G304: same directory as source
+	// Keep the original owner/group mode where it is already secure, while
+	// stripping world permissions from an accidentally broad source file. The
+	// temporary file is created owner-only first so bytes are never exposed
+	// before chmod/rename completes.
+	mode := srcInfo.Mode().Perm() & 0o660
+	if mode == 0 {
+		mode = 0o600
+	}
+	dst, err := os.CreateTemp(filepath.Dir(dbPath), filepath.Base(dbPath)+".compact-*") //nolint:gosec // G304: same directory as source
 	if err != nil {
 		_ = src.Close()
 		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := dst.Name()
+	if err := preserveFileOwnership(tmpPath, srcInfo); err != nil {
+		_ = dst.Close()
+		_ = src.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("preserve compact file ownership: %w", err)
+	}
+	if err := dst.Chmod(mode); err != nil {
+		_ = dst.Close()
+		_ = src.Close()
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("set compact file permissions: %w", err)
 	}
 
 	writeErr := src.View(func(tx *bolt.Tx) error {
 		_, werr := tx.WriteTo(dst)
 		return werr
 	})
-	_ = dst.Close()
+	if syncErr := dst.Sync(); writeErr == nil && syncErr != nil {
+		writeErr = syncErr
+	}
+	if closeErr := dst.Close(); writeErr == nil && closeErr != nil {
+		writeErr = closeErr
+	}
 	_ = src.Close()
 
 	if writeErr != nil {
@@ -51,6 +77,20 @@ func CompactDB(dbPath string) error {
 	if err := os.Rename(tmpPath, dbPath); err != nil {
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("replace original with compact copy: %w", err)
+	}
+	// fsync the directory entry after rename so a power loss cannot leave the
+	// old or new name indeterminate after the compacted file itself was synced.
+	dir, err := os.Open(filepath.Dir(dbPath))
+	if err != nil {
+		return fmt.Errorf("open database directory after replacement: %w", err)
+	}
+	syncErr := dir.Sync()
+	closeErr := dir.Close()
+	if syncErr != nil {
+		return fmt.Errorf("sync database directory after replacement: %w", syncErr)
+	}
+	if closeErr != nil {
+		return fmt.Errorf("close database directory after replacement: %w", closeErr)
 	}
 
 	afterInfo, err := os.Stat(dbPath)

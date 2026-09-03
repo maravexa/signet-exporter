@@ -25,7 +25,7 @@ type integrationMockScanner struct {
 	results []scanner.ScanResult
 }
 
-func (m *integrationMockScanner) Name() string { return "mock" }
+func (m *integrationMockScanner) Name() string { return "arp" }
 
 func (m *integrationMockScanner) Scan(_ context.Context, _ netip.Prefix) ([]scanner.ScanResult, error) {
 	return m.results, nil
@@ -46,7 +46,7 @@ func makeMockResults() []scanner.ScanResult {
 			IP:        netip.MustParseAddr(h.ip),
 			MAC:       hw,
 			Alive:     true,
-			Source:    "mock",
+			Source:    "arp",
 			Timestamp: time.Now(),
 		}
 	}
@@ -201,7 +201,7 @@ func TestFullStack_ReadyGating(t *testing.T) {
 // delayedMockScanner simulates a slow scan.
 type delayedMockScanner struct{ delay time.Duration }
 
-func (d *delayedMockScanner) Name() string { return "slow-mock" }
+func (d *delayedMockScanner) Name() string { return "arp" }
 
 func (d *delayedMockScanner) Scan(ctx context.Context, _ netip.Prefix) ([]scanner.ScanResult, error) {
 	select {

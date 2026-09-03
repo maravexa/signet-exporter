@@ -152,10 +152,82 @@ func TestValidateReloadable_InvalidCIDR(t *testing.T) {
 	}
 }
 
+func TestValidateReloadable_RejectsCanonicalDuplicateAndOverlap(t *testing.T) {
+	tests := []struct {
+		name    string
+		subnets []ReloadableSubnet
+	}{
+		{
+			name: "canonical duplicate",
+			subnets: []ReloadableSubnet{
+				makeRS("10.0.1.0/24", time.Minute),
+				makeRS("10.0.1.42/24", time.Minute),
+			},
+		},
+		{
+			name: "overlap",
+			subnets: []ReloadableSubnet{
+				makeRS("10.0.0.0/16", time.Minute),
+				makeRS("10.0.1.0/24", time.Minute),
+			},
+		},
+		{
+			name: "ipv6 unsupported",
+			subnets: []ReloadableSubnet{
+				makeRS("2001:db8::/64", time.Minute),
+			},
+		},
+		{
+			name: "too large",
+			subnets: []ReloadableSubnet{
+				makeRS("10.0.0.0/15", time.Minute),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ValidateReloadable(ReloadableConfig{Subnets: tt.subnets}); err == nil {
+				t.Fatal("expected validation error")
+			}
+		})
+	}
+}
+
+func TestValidateReloadable_HostTTL(t *testing.T) {
+	valid := makeRC(makeRS("10.0.1.0/24", time.Minute))
+	valid.HostTTL = 0
+	valid.HostTTLSet = true
+	if err := ValidateReloadable(valid); err != nil {
+		t.Fatalf("explicit zero host_ttl should be valid: %v", err)
+	}
+	valid.HostTTL = -time.Second
+	if err := ValidateReloadable(valid); err == nil {
+		t.Fatal("expected negative host_ttl validation error")
+	}
+}
+
+func TestDiff_HostTTLPresenceChange(t *testing.T) {
+	old := makeRC(makeRS("10.0.1.0/24", time.Minute))
+	new := old
+	new.HostTTLSet = true
+	changes := Diff(old, new)
+	if len(changes) != 1 || changes[0] != "host_ttl: default → 0s" {
+		t.Fatalf("unexpected changes: %v", changes)
+	}
+}
+
 func TestValidateReloadable_InvalidPort(t *testing.T) {
 	rc := makeRC(ReloadableSubnet{CIDR: "10.0.1.0/24", ScanInterval: 60 * time.Second, Ports: []int{70000}})
 	if err := ValidateReloadable(rc); err == nil {
 		t.Error("expected error for port > 65535, got nil")
+	}
+}
+
+func TestValidateReloadable_DuplicatePort(t *testing.T) {
+	rc := makeRC(ReloadableSubnet{CIDR: "10.0.1.0/24", ScanInterval: time.Minute, Ports: []int{443, 443}})
+	if err := ValidateReloadable(rc); err == nil {
+		t.Fatal("expected duplicate port error")
 	}
 }
 

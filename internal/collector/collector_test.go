@@ -197,6 +197,113 @@ func TestCollect_HostUp_Stale(t *testing.T) {
 	}
 }
 
+func TestCollect_HostUpRequiresFreshSuccessfulDiscovery(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.1.0/24"
+	now := time.Now()
+
+	// A DNS update must not revive a stale ARP/ICMP presence observation.
+	arp := makeHost("10.0.1.20", "aa:bb:cc:dd:ee:20", func(r *state.HostRecord) {
+		r.Source = state.SourceARP
+		r.ObservedAt = now.Add(-10 * time.Minute)
+		r.LastSeen = r.ObservedAt
+		r.Alive = true
+	})
+	if _, err := store.UpdateHost(ctx, arp); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateHost(ctx, state.HostRecord{
+		IP:            arp.IP,
+		Source:        state.SourceDNS,
+		ObservedAt:    now,
+		MAC:           arp.MAC,
+		Hostnames:     []string{"host.example"},
+		DNSMismatches: []string{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Even a fresh timestamp is not up when the discovery observation did not
+	// establish presence.
+	inactive := makeHost("10.0.1.21", "aa:bb:cc:dd:ee:21", func(r *state.HostRecord) {
+		r.Source = state.SourceICMP
+		r.ObservedAt = now
+		r.LastSeen = now
+		r.Alive = false
+	})
+	if _, err := store.UpdateHost(ctx, inactive); err != nil {
+		t.Fatal(err)
+	}
+
+	fam := findMetric(collectMetrics(newTestCollector(store, subnet)), "signet_host_up")
+	if fam == nil {
+		t.Fatal("signet_host_up not emitted")
+	}
+	for _, ip := range []string{"10.0.1.20", "10.0.1.21"} {
+		sample := findSample(fam, map[string]string{"ip": ip, "subnet": subnet})
+		if sample == nil {
+			t.Errorf("host_up[%s] missing", ip)
+			continue
+		}
+		if got := sample.GetGauge().GetValue(); got != 0 {
+			t.Errorf("host_up[%s] = %v, want 0", ip, got)
+		}
+	}
+}
+
+func TestCollectorApplyConfigAtomicallyReplacesSubnetMembership(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnetA := netip.MustParsePrefix("10.0.40.0/24")
+	subnetB := netip.MustParsePrefix("10.0.41.0/24")
+	for _, record := range []state.HostRecord{
+		makeHost("10.0.40.1", "aa:bb:cc:dd:ee:40"),
+		makeHost("10.0.41.1", "aa:bb:cc:dd:ee:41"),
+	} {
+		if _, err := store.UpdateHost(ctx, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := NewSignetCollector(store, []netip.Prefix{subnetA}, nil)
+	c.ApplyConfig(Config{Subnets: []SubnetConfig{{Prefix: subnetB, ScanInterval: time.Minute}}})
+	families := collectMetrics(c)
+	used := findMetric(families, "signet_subnet_addresses_used")
+	if got := findSample(used, map[string]string{"subnet": subnetA.String()}); got != nil {
+		t.Errorf("removed subnet %s remained in collector output", subnetA)
+	}
+	if got := findSample(used, map[string]string{"subnet": subnetB.String()}); got == nil || got.GetGauge().GetValue() != 1 {
+		t.Errorf("new subnet %s not reflected in collector output", subnetB)
+	}
+}
+
+func TestCollectorApplyConfigReloadsPresenceFreshnessWindow(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	prefix := netip.MustParsePrefix("10.0.42.0/24")
+	seen := time.Now().Add(-10 * time.Minute)
+	if _, err := store.UpdateHost(ctx, makeHost("10.0.42.1", "aa:bb:cc:dd:ee:42", func(r *state.HostRecord) {
+		r.LastSeen = seen
+		r.Alive = true
+	})); err != nil {
+		t.Fatal(err)
+	}
+
+	c := NewSignetCollector(store, []netip.Prefix{prefix}, nil)
+	c.ApplyConfig(Config{Subnets: []SubnetConfig{{Prefix: prefix, ScanInterval: 5 * time.Minute}}})
+	up := findMetric(collectMetrics(c), "signet_host_up")
+	if got := up.GetMetric()[0].GetGauge().GetValue(); got != 1 {
+		t.Errorf("host on 5m subnet after 10m = %v, want 1 within 3x interval", got)
+	}
+
+	c.ApplyConfig(Config{Subnets: []SubnetConfig{{Prefix: prefix, ScanInterval: time.Minute}}})
+	up = findMetric(collectMetrics(c), "signet_host_up")
+	if got := up.GetMetric()[0].GetGauge().GetValue(); got != 0 {
+		t.Errorf("host after interval reload to 1m = %v, want 0", got)
+	}
+}
+
 func TestCollect_SubnetUtilization(t *testing.T) {
 	ctx := context.Background()
 	store := state.NewMemoryStore()
@@ -310,11 +417,15 @@ func TestCollect_UnauthorizedDevice(t *testing.T) {
 	rogue := makeHost("10.0.3.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
 		r.Authorized = false
 		r.AuthorizationChecked = true
+		r.AuthorizationScope = "allowlist-v1"
+		r.AuthorizationGeneration = 1
 	})
 	// Checked + authorized: must NOT emit metric.
 	legit := makeHost("10.0.3.2", "aa:bb:cc:dd:ee:02", func(r *state.HostRecord) {
 		r.Authorized = true
 		r.AuthorizationChecked = true
+		r.AuthorizationScope = "allowlist-v1"
+		r.AuthorizationGeneration = 1
 	})
 	// Unchecked (no allowlist configured): must NOT emit metric.
 	unchecked := makeHost("10.0.3.3", "aa:bb:cc:dd:ee:03")
@@ -326,6 +437,9 @@ func TestCollect_UnauthorizedDevice(t *testing.T) {
 	}
 
 	c := newTestCollector(store, subnet)
+	c.ApplyConfig(Config{Generation: 1, Subnets: []SubnetConfig{{
+		Prefix: netip.MustParsePrefix(subnet), ScanInterval: time.Minute, AuthorizationScope: "allowlist-v1",
+	}}})
 	families := collectMetrics(c)
 
 	fam := findMetric(families, "signet_unauthorized_device_detected")
@@ -397,6 +511,68 @@ func TestCollect_PortOpen(t *testing.T) {
 		if s.GetGauge().GetValue() != 1.0 {
 			t.Errorf("port_open[%s] = %v, want 1", port, s.GetGauge().GetValue())
 		}
+	}
+}
+
+func TestCollect_HidesPortAndAuthorizationObservationsFromOlderGeneration(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	const subnet = "10.0.44.0/24"
+	record := makeHost("10.0.44.1", "aa:bb:cc:dd:ee:44", func(r *state.HostRecord) {
+		r.OpenPorts = []uint16{22, 443}
+		r.PortsGeneration = 7
+		r.AuthorizationChecked = true
+		r.Authorized = false
+		r.AuthorizationScope = "allowlist-v7"
+		r.AuthorizationGeneration = 7
+	})
+	if _, err := store.UpdateHost(ctx, record); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	c.ApplyConfig(Config{Generation: 7, Subnets: []SubnetConfig{{
+		Prefix: netip.MustParsePrefix(subnet), ScanInterval: time.Minute, AuthorizationScope: "allowlist-v7",
+	}}})
+	families := collectMetrics(c)
+	if got := findMetric(families, "signet_port_open"); got == nil || len(got.GetMetric()) != 2 {
+		t.Fatalf("matching generation port metrics = %#v, want two samples", got)
+	}
+	if got := findMetric(families, "signet_unauthorized_device_detected"); got == nil || len(got.GetMetric()) != 1 {
+		t.Fatalf("matching generation authorization metric = %#v, want one sample", got)
+	}
+
+	// A committed configuration change hides retained observations immediately.
+	// This covers both a removed port list and an old cycle completing after a
+	// newer generation has become active.
+	c.ApplyConfig(Config{Generation: 8, Subnets: []SubnetConfig{{
+		Prefix: netip.MustParsePrefix(subnet), ScanInterval: time.Minute, AuthorizationScope: "allowlist-v8",
+	}}})
+	families = collectMetrics(c)
+	if got := findMetric(families, "signet_port_open"); got != nil {
+		t.Fatalf("old-generation ports remained visible: %#v", got.GetMetric())
+	}
+	if got := findMetric(families, "signet_unauthorized_device_detected"); got != nil {
+		t.Fatalf("old-generation authorization result remained visible: %#v", got.GetMetric())
+	}
+}
+
+func TestCollect_HostUpRejectsFutureLastSeen(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	const subnet = "10.0.45.0/24"
+	if _, err := store.UpdateHost(ctx, makeHost("10.0.45.1", "aa:bb:cc:dd:ee:45", func(r *state.HostRecord) {
+		r.LastSeen = time.Now().Add(time.Minute)
+		r.Alive = true
+	})); err != nil {
+		t.Fatal(err)
+	}
+	family := findMetric(collectMetrics(newTestCollector(store, subnet)), "signet_host_up")
+	if family == nil || len(family.GetMetric()) != 1 {
+		t.Fatalf("host_up metrics = %#v, want one sample", family)
+	}
+	if got := family.GetMetric()[0].GetGauge().GetValue(); got != 0 {
+		t.Errorf("future LastSeen host_up = %v, want 0", got)
 	}
 }
 
@@ -908,8 +1084,8 @@ func TestActiveSeriesEstimateZeroHosts(t *testing.T) {
 		t.Fatal("signet_active_series_estimate not emitted")
 	}
 	val := fam.GetMetric()[0].GetGauge().GetValue()
-	if val != 0.0 {
-		t.Errorf("estimate with no hosts and no subnets = %v, want 0", val)
+	if val != 3.0 {
+		t.Errorf("estimate with no hosts and no subnets = %v, want 3 global collector series", val)
 	}
 }
 
@@ -927,18 +1103,16 @@ func TestActiveSeriesEstimateScalesWithPorts(t *testing.T) {
 		if _, err := storeA.UpdateHost(ctx, rec); err != nil {
 			t.Fatal(err)
 		}
+		rec.OpenPorts = []uint16{22, 80, 443, 8080, 8443}
 		if _, err := storeB.UpdateHost(ctx, rec); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	// Collector with 1 port.
+	// Collector with no currently open ports.
 	cA := newTestCollector(storeA, subnet)
-	cA.SetPortCount(1)
-
-	// Collector with 5 ports.
+	// Collector with five currently open ports per host.
 	cB := newTestCollector(storeB, subnet)
-	cB.SetPortCount(5)
 
 	famA := findMetric(collectMetrics(cA), "signet_active_series_estimate")
 	famB := findMetric(collectMetrics(cB), "signet_active_series_estimate")
@@ -951,7 +1125,7 @@ func TestActiveSeriesEstimateScalesWithPorts(t *testing.T) {
 	estB := famB.GetMetric()[0].GetGauge().GetValue()
 
 	if estB <= estA {
-		t.Errorf("estimate with 5 ports (%v) should be greater than with 1 port (%v)", estB, estA)
+		t.Errorf("estimate with 5 open ports (%v) should be greater than with no open ports (%v)", estB, estA)
 	}
 }
 
@@ -978,9 +1152,7 @@ func TestActiveSeriesEstimateScalesWithHosts(t *testing.T) {
 	}
 
 	cSmall := newTestCollector(storeSmall, subnet)
-	cSmall.SetPortCount(3)
 	cLarge := newTestCollector(storeLarge, subnet)
-	cLarge.SetPortCount(3)
 
 	famSmall := findMetric(collectMetrics(cSmall), "signet_active_series_estimate")
 	famLarge := findMetric(collectMetrics(cLarge), "signet_active_series_estimate")
@@ -1008,7 +1180,6 @@ func TestActiveSeriesEstimatePresent(t *testing.T) {
 	}
 
 	c := newTestCollector(store, subnet)
-	c.SetPortCount(3)
 	families := collectMetrics(c)
 
 	fam := findMetric(families, "signet_active_series_estimate")
@@ -1021,6 +1192,37 @@ func TestActiveSeriesEstimatePresent(t *testing.T) {
 	val := fam.GetMetric()[0].GetGauge().GetValue()
 	if val <= 0 {
 		t.Errorf("signet_active_series_estimate = %v, want > 0 with hosts and ports", val)
+	}
+}
+
+func TestActiveSeriesEstimateMatchesCurrentCollectorOutput(t *testing.T) {
+	ctx := context.Background()
+	store := state.NewMemoryStore()
+	subnet := "10.0.33.0/24"
+
+	rec := makeHost("10.0.33.1", "aa:bb:cc:dd:ee:01", func(r *state.HostRecord) {
+		r.AuthorizationChecked = true
+		r.Authorized = false
+		r.MACChangeCount = 1
+		r.DNSMismatches = []string{"one.example", "two.example"}
+		r.DuplicateMACs = []net.HardwareAddr{{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x02}}
+	})
+	if _, err := store.UpdateHost(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+
+	c := newTestCollector(store, subnet)
+	families := collectMetrics(c)
+	fam := findMetric(families, "signet_active_series_estimate")
+	if fam == nil {
+		t.Fatal("signet_active_series_estimate not emitted")
+	}
+	actual := 0
+	for _, family := range families {
+		actual += len(family.GetMetric())
+	}
+	if got := fam.GetMetric()[0].GetGauge().GetValue(); got != float64(actual) {
+		t.Errorf("active series estimate = %v, want exact emitted-series count %d", got, actual)
 	}
 }
 

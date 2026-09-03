@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
 	"time"
 
 	bolt "go.etcd.io/bbolt"
@@ -23,6 +24,10 @@ var (
 	schemaVersion  = []byte("1")
 )
 
+// DefaultMaxChanges bounds the retained MAC-IP binding history in both store
+// implementations. It limits disk growth while keeping recent audit context.
+const DefaultMaxChanges = 10000
+
 // BoltStore is a bbolt-backed persistent Store implementation.
 //
 // Bucket layout:
@@ -32,37 +37,117 @@ var (
 //	"scanmeta" → key: "subnet/scanner" → value: JSON scanMetaJSON
 //	"meta"     → key: "version"     → value: schema version ("1")
 type BoltStore struct {
-	db *bolt.DB
+	db         *bolt.DB
+	maxChanges int
 }
 
 // NewBoltStore opens or creates the bbolt database at path.
 // File mode 0o660 (owner+group rw). Timeout 1s — fail fast if another process
 // holds the lock (i.e. another signet-exporter instance is running).
-// Creates all required buckets and writes schema version on first open.
+// Creates all required buckets and writes schema version on first open. Schema
+// v1 is additive: absent JSON fields are accepted as legacy v1 records, while
+// any explicit version other than v1 is rejected before normal operation.
 func NewBoltStore(path string) (*BoltStore, error) {
+	return newBoltStore(path, DefaultMaxChanges)
+}
+
+// newBoltStore allows package tests to exercise retention behavior with a
+// small limit. Production callers use NewBoltStore and DefaultMaxChanges.
+func newBoltStore(path string, maxChanges int) (*BoltStore, error) {
+	if maxChanges <= 0 {
+		maxChanges = DefaultMaxChanges
+	}
+	info, statErr := os.Lstat(path)
+	created := os.IsNotExist(statErr)
+	if statErr != nil && !created {
+		return nil, fmt.Errorf("stat bolt db %q: %w", path, statErr)
+	}
+	if !created {
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("bolt db %q must be a regular file, got %s", path, info.Mode().Type())
+		}
+		if info.Mode().Perm()&0o007 != 0 {
+			return nil, fmt.Errorf("bolt db %q is world-accessible (mode %#o)", path, info.Mode().Perm())
+		}
+	}
 	opts := &bolt.Options{Timeout: time.Second}
 	db, err := bolt.Open(path, 0o660, opts) //nolint:gosec // G304: path is operator-supplied config, not user input
 	if err != nil {
 		return nil, fmt.Errorf("open bolt db %q: %w", path, err)
 	}
 
+	if created {
+		if err := os.Chmod(path, 0o660); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("set bolt db permissions %q: %w", path, err)
+		}
+	}
+
 	if err := db.Update(func(tx *bolt.Tx) error {
-		for _, name := range [][]byte{bucketHosts, bucketChanges, bucketScanMeta, bucketMeta} {
+		meta, err := tx.CreateBucketIfNotExists(bucketMeta)
+		if err != nil {
+			return fmt.Errorf("create bucket %q: %w", bucketMeta, err)
+		}
+		version := meta.Get(keyVersion)
+		if version == nil {
+			if err := meta.Put(keyVersion, schemaVersion); err != nil {
+				return fmt.Errorf("write schema version: %w", err)
+			}
+		} else if !bytes.Equal(version, schemaVersion) {
+			return fmt.Errorf("unsupported schema version %q (supported: %q)", version, schemaVersion)
+		}
+		for _, name := range [][]byte{bucketHosts, bucketChanges, bucketScanMeta} {
 			if _, berr := tx.CreateBucketIfNotExists(name); berr != nil {
 				return fmt.Errorf("create bucket %q: %w", name, berr)
 			}
 		}
-		meta := tx.Bucket(bucketMeta)
-		if meta.Get(keyVersion) == nil {
-			return meta.Put(keyVersion, schemaVersion)
-		}
-		return nil
+		return resetSessionGenerationsTx(tx)
 	}); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("init bolt schema: %w", err)
 	}
 
-	return &BoltStore{db: db}, nil
+	return &BoltStore{db: db, maxChanges: maxChanges}, nil
+}
+
+// resetSessionGenerationsTx clears process-local configuration-generation
+// floors on every durable-store open. Scheduler generations intentionally
+// restart from a small counter after process restart, so persisting a prior
+// process's floor would reject all fresh port/authorization observations. The
+// actual historical values remain available to collectors until revalidation.
+func resetSessionGenerationsTx(tx *bolt.Tx) error {
+	hosts := tx.Bucket(bucketHosts)
+	type replacement struct {
+		key  []byte
+		data []byte
+	}
+	replacements := make([]replacement, 0)
+	if err := hosts.ForEach(func(k, v []byte) error {
+		host, err := unmarshalHostRecord(v)
+		if err != nil {
+			return fmt.Errorf("corrupt host record %q: %w", k, err)
+		}
+		if host.PortsGeneration == 0 && host.AuthorizationGeneration == 0 {
+			return nil
+		}
+		host.PortsGeneration = 0
+		host.AuthorizationGeneration = 0
+		data, err := marshalHostRecord(host)
+		if err != nil {
+			return fmt.Errorf("normalize host record %q: %w", k, err)
+		}
+		key := append([]byte(nil), k...)
+		replacements = append(replacements, replacement{key: key, data: data})
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, replacement := range replacements {
+		if err := hosts.Put(replacement.key, replacement.data); err != nil {
+			return fmt.Errorf("reset session generation %q: %w", replacement.key, err)
+		}
+	}
+	return nil
 }
 
 // PruneStale removes all hosts whose LastSeen is older than ttl.
@@ -70,24 +155,46 @@ func NewBoltStore(path string) (*BoltStore, error) {
 // UpdateHost can resurrect a host between the stale check and the delete.
 // Returns the IPs of removed hosts, or an error if ttl is invalid or the transaction fails.
 func (b *BoltStore) PruneStale(ttl time.Duration) ([]string, error) {
+	removedHosts, err := b.PruneStaleHosts(ttl)
+	if err != nil {
+		return nil, err
+	}
+	removed := make([]string, len(removedHosts))
+	for i, host := range removedHosts {
+		removed[i] = host.IP.String()
+	}
+	return removed, nil
+}
+
+// PruneStaleHosts removes stale hosts and returns their pre-delete records in
+// the same write transaction. Corrupt records abort the transaction and are
+// left untouched so operators can repair or inspect the database.
+func (b *BoltStore) PruneStaleHosts(ttl time.Duration) ([]HostRecord, error) {
 	if ttl <= 0 {
 		return nil, fmt.Errorf("invalid TTL: %v", ttl)
 	}
-	var removed []string
+	removed := make([]HostRecord, 0)
 	err := b.db.Update(func(tx *bolt.Tx) error {
 		hBkt := tx.Bucket(bucketHosts)
 		var staleKeys [][]byte
 		if err := hBkt.ForEach(func(k, v []byte) error {
 			r, rerr := unmarshalHostRecord(v)
 			if rerr != nil {
-				return nil // skip corrupt records
+				return fmt.Errorf("corrupt host record %q: %w", k, rerr)
+			}
+			ip, ipErr := netip.ParseAddr(string(k))
+			if ipErr != nil {
+				return fmt.Errorf("corrupt host key %q: %w", k, ipErr)
+			}
+			if r.IP != ip {
+				return fmt.Errorf("corrupt host record %q: embedded IP is %q", k, r.IP)
 			}
 			if IsStale(r.LastSeen, ttl) {
 				// Copy key — ForEach keys are only valid inside the callback.
 				keyCopy := make([]byte, len(k))
 				copy(keyCopy, k)
 				staleKeys = append(staleKeys, keyCopy)
-				removed = append(removed, string(k))
+				removed = append(removed, copyHostRecord(&r))
 			}
 			return nil
 		}); err != nil {
@@ -116,20 +223,30 @@ func (b *BoltStore) Close() error {
 // hostRecordJSON is the on-disk representation of HostRecord.
 // net.HardwareAddr values are stored as colon-separated hex MAC strings.
 type hostRecordJSON struct {
-	IP                   string   `json:"ip"`
-	MAC                  string   `json:"mac,omitempty"`
-	Vendor               string   `json:"vendor,omitempty"`
-	Hostnames            []string `json:"hostnames,omitempty"`
-	DNSMismatches        []string `json:"dns_mismatches,omitempty"`
-	FirstSeen            int64    `json:"first_seen_ns"`
-	LastSeen             int64    `json:"last_seen_ns"`
-	OpenPorts            []uint16 `json:"open_ports,omitempty"`
-	DuplicateMACs        []string `json:"duplicate_macs,omitempty"`
-	Alive                bool     `json:"alive"`
-	Authorized           bool     `json:"authorized"`
-	AuthorizationChecked bool     `json:"authorization_checked"`
-	DuplicateChecked     bool     `json:"duplicate_checked"`
-	MACChangeCount       uint64   `json:"mac_change_count"`
+	IP                      string   `json:"ip"`
+	Source                  string   `json:"source,omitempty"`
+	ObservedAt              int64    `json:"observed_at_ns,omitempty"`
+	ConfigGeneration        uint64   `json:"config_generation,omitempty"`
+	MAC                     string   `json:"mac,omitempty"`
+	Vendor                  string   `json:"vendor,omitempty"`
+	Hostnames               []string `json:"hostnames"`
+	DNSMismatches           []string `json:"dns_mismatches"`
+	FirstSeen               int64    `json:"first_seen_ns"`
+	LastSeen                int64    `json:"last_seen_ns"`
+	OpenPorts               []uint16 `json:"open_ports"`
+	DuplicateMACs           []string `json:"duplicate_macs,omitempty"`
+	Alive                   bool     `json:"alive"`
+	Authorized              bool     `json:"authorized"`
+	AuthorizationChecked    bool     `json:"authorization_checked"`
+	AuthorizationScope      string   `json:"authorization_scope,omitempty"`
+	DuplicateChecked        bool     `json:"duplicate_checked"`
+	MACChangeCount          uint64   `json:"mac_change_count"`
+	MACObservedAt           int64    `json:"mac_observed_at_ns,omitempty"`
+	DNSObservedAt           int64    `json:"dns_observed_at_ns,omitempty"`
+	PortsObservedAt         int64    `json:"ports_observed_at_ns,omitempty"`
+	AuthorizationObservedAt int64    `json:"authorization_observed_at_ns,omitempty"`
+	PortsGeneration         uint64   `json:"ports_generation,omitempty"`
+	AuthorizationGeneration uint64   `json:"authorization_generation,omitempty"`
 }
 
 type macIPChangeJSON struct {
@@ -152,18 +269,28 @@ type scanMetaJSON struct {
 
 func marshalHostRecord(r HostRecord) ([]byte, error) {
 	j := hostRecordJSON{
-		IP:                   r.IP.String(),
-		Vendor:               r.Vendor,
-		Hostnames:            r.Hostnames,
-		DNSMismatches:        r.DNSMismatches,
-		FirstSeen:            r.FirstSeen.UnixNano(),
-		LastSeen:             r.LastSeen.UnixNano(),
-		OpenPorts:            r.OpenPorts,
-		Alive:                r.Alive,
-		Authorized:           r.Authorized,
-		AuthorizationChecked: r.AuthorizationChecked,
-		DuplicateChecked:     r.DuplicateChecked,
-		MACChangeCount:       r.MACChangeCount,
+		IP:                      r.IP.String(),
+		Source:                  string(r.Source),
+		ObservedAt:              unixNanoOrZero(r.ObservedAt),
+		ConfigGeneration:        r.ConfigGeneration,
+		Vendor:                  r.Vendor,
+		Hostnames:               r.Hostnames,
+		DNSMismatches:           r.DNSMismatches,
+		FirstSeen:               unixNanoOrZero(r.FirstSeen),
+		LastSeen:                unixNanoOrZero(r.LastSeen),
+		OpenPorts:               r.OpenPorts,
+		Alive:                   r.Alive,
+		Authorized:              r.Authorized,
+		AuthorizationChecked:    r.AuthorizationChecked,
+		AuthorizationScope:      r.AuthorizationScope,
+		DuplicateChecked:        r.DuplicateChecked,
+		MACChangeCount:          r.MACChangeCount,
+		MACObservedAt:           unixNanoOrZero(r.MACObservedAt),
+		DNSObservedAt:           unixNanoOrZero(r.DNSObservedAt),
+		PortsObservedAt:         unixNanoOrZero(r.PortsObservedAt),
+		AuthorizationObservedAt: unixNanoOrZero(r.AuthorizationObservedAt),
+		PortsGeneration:         r.PortsGeneration,
+		AuthorizationGeneration: r.AuthorizationGeneration,
 	}
 	if len(r.MAC) > 0 {
 		j.MAC = r.MAC.String()
@@ -177,6 +304,20 @@ func marshalHostRecord(r HostRecord) ([]byte, error) {
 	return json.Marshal(j)
 }
 
+func unixNanoOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.UnixNano()
+}
+
+func timeFromUnixNano(ns int64) time.Time {
+	if ns == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns).UTC()
+}
+
 func unmarshalHostRecord(data []byte) (HostRecord, error) {
 	var j hostRecordJSON
 	if err := json.Unmarshal(data, &j); err != nil {
@@ -187,18 +328,31 @@ func unmarshalHostRecord(data []byte) (HostRecord, error) {
 		return HostRecord{}, fmt.Errorf("parse IP %q: %w", j.IP, err)
 	}
 	r := HostRecord{
-		IP:                   ip,
-		Vendor:               j.Vendor,
-		Hostnames:            j.Hostnames,
-		DNSMismatches:        j.DNSMismatches,
-		FirstSeen:            time.Unix(0, j.FirstSeen).UTC(),
-		LastSeen:             time.Unix(0, j.LastSeen).UTC(),
-		OpenPorts:            j.OpenPorts,
-		Alive:                j.Alive,
-		Authorized:           j.Authorized,
-		AuthorizationChecked: j.AuthorizationChecked,
-		DuplicateChecked:     j.DuplicateChecked,
-		MACChangeCount:       j.MACChangeCount,
+		IP:                      ip,
+		Source:                  ObservationSource(j.Source),
+		ObservedAt:              timeFromUnixNano(j.ObservedAt),
+		ConfigGeneration:        j.ConfigGeneration,
+		Vendor:                  j.Vendor,
+		Hostnames:               j.Hostnames,
+		DNSMismatches:           j.DNSMismatches,
+		FirstSeen:               timeFromUnixNano(j.FirstSeen),
+		LastSeen:                timeFromUnixNano(j.LastSeen),
+		OpenPorts:               j.OpenPorts,
+		Alive:                   j.Alive,
+		Authorized:              j.Authorized,
+		AuthorizationChecked:    j.AuthorizationChecked,
+		AuthorizationScope:      j.AuthorizationScope,
+		DuplicateChecked:        j.DuplicateChecked,
+		MACChangeCount:          j.MACChangeCount,
+		MACObservedAt:           timeFromUnixNano(j.MACObservedAt),
+		DNSObservedAt:           timeFromUnixNano(j.DNSObservedAt),
+		PortsObservedAt:         timeFromUnixNano(j.PortsObservedAt),
+		AuthorizationObservedAt: timeFromUnixNano(j.AuthorizationObservedAt),
+		PortsGeneration:         j.PortsGeneration,
+		AuthorizationGeneration: j.AuthorizationGeneration,
+	}
+	if !validObservationSource(r.Source) {
+		return HostRecord{}, fmt.Errorf("unknown observation source %q", r.Source)
 	}
 	if j.MAC != "" {
 		mac, merr := net.ParseMAC(j.MAC)
@@ -217,12 +371,37 @@ func unmarshalHostRecord(data []byte) (HostRecord, error) {
 			r.DuplicateMACs[i] = mac
 		}
 	}
+	deriveLegacyWatermarks(&r)
 	return r, nil
 }
 
-// appendChangeTx writes a MACIPChange into the changes bucket using an
-// auto-incrementing sequence key. Must be called inside a write transaction.
-func appendChangeTx(tx *bolt.Tx, event MACIPChange) error {
+// deriveLegacyWatermarks protects records written before source-owned
+// watermarks existed. Old v1 JSON omitted those fields, so LastSeen is the only
+// conservative ordering evidence available. We apply it only to populated
+// fields; this may reject a legitimately delayed first enrichment after an
+// upgrade, but never lets an ambiguous older observation regress persisted
+// inventory. The normalized fields are written on the next successful update.
+func deriveLegacyWatermarks(r *HostRecord) {
+	if r.LastSeen.IsZero() {
+		return
+	}
+	if r.MACObservedAt.IsZero() && len(r.MAC) > 0 {
+		r.MACObservedAt = r.LastSeen
+	}
+	if r.DNSObservedAt.IsZero() && (len(r.Hostnames) > 0 || len(r.DNSMismatches) > 0) {
+		r.DNSObservedAt = r.LastSeen
+	}
+	if r.PortsObservedAt.IsZero() && len(r.OpenPorts) > 0 {
+		r.PortsObservedAt = r.LastSeen
+	}
+	if r.AuthorizationObservedAt.IsZero() && r.AuthorizationChecked {
+		r.AuthorizationObservedAt = r.LastSeen
+	}
+}
+
+// appendChangeTx writes a MACIPChange into the bounded persistent history.
+// Must be called inside a write transaction.
+func appendChangeTx(tx *bolt.Tx, event MACIPChange, maxChanges int) error {
 	bkt := tx.Bucket(bucketChanges)
 	seq, err := bkt.NextSequence()
 	if err != nil {
@@ -240,14 +419,42 @@ func appendChangeTx(tx *bolt.Tx, event MACIPChange) error {
 	}
 	var key [8]byte
 	binary.BigEndian.PutUint64(key[:], seq)
-	return bkt.Put(key[:], data)
+	if err := bkt.Put(key[:], data); err != nil {
+		return err
+	}
+	if maxChanges <= 0 {
+		maxChanges = DefaultMaxChanges
+	}
+	count := 0
+	if err := bkt.ForEach(func(_, _ []byte) error {
+		count++
+		return nil
+	}); err != nil {
+		return fmt.Errorf("count MAC changes: %w", err)
+	}
+	for excess := count - maxChanges; excess > 0; excess-- {
+		k, _ := bkt.Cursor().First()
+		if k == nil {
+			break
+		}
+		if err := bkt.Delete(k); err != nil {
+			return fmt.Errorf("prune oldest MAC change: %w", err)
+		}
+	}
+	return nil
 }
 
 // ---- Store interface implementation ----------------------------------------
 
 // UpdateHost inserts or updates a host record and reports what changed.
 // The entire read-modify-write is performed atomically inside a single db.Update.
-func (b *BoltStore) UpdateHost(_ context.Context, record HostRecord) (HostChange, error) {
+func (b *BoltStore) UpdateHost(ctx context.Context, record HostRecord) (HostChange, error) {
+	if err := contextErr(ctx); err != nil {
+		return HostChange{}, err
+	}
+	if !validObservationSource(record.Source) {
+		return HostChange{}, fmt.Errorf("unknown observation source %q", record.Source)
+	}
 	var change HostChange
 	err := b.db.Update(func(tx *bolt.Tx) error {
 		hBkt := tx.Bucket(bucketHosts)
@@ -256,15 +463,18 @@ func (b *BoltStore) UpdateHost(_ context.Context, record HostRecord) (HostChange
 
 		// ---- new host -------------------------------------------------------
 		if data == nil {
-			r := record
-			if r.FirstSeen.IsZero() {
-				r.FirstSeen = r.LastSeen
+			if !sourceCanCreateHost(record.Source) {
+				// DNS/port/authorization observations are enrichment of an existing
+				// host and cannot resurrect a record removed by TTL eviction.
+				return nil
 			}
+			r := newObservedHost(record)
 			encoded, err := marshalHostRecord(r)
 			if err != nil {
 				return err
 			}
 			change = HostChange{
+				Applied:           true,
 				IsNew:             true,
 				DuplicateDetected: record.DuplicateChecked && len(record.DuplicateMACs) > 0,
 			}
@@ -276,111 +486,17 @@ func (b *BoltStore) UpdateHost(_ context.Context, record HostRecord) (HostChange
 			return fmt.Errorf("unmarshal existing host %s: %w", record.IP, err)
 		}
 
-		// ---- no MAC in incoming record (ICMP / DNS) -------------------------
-		if len(record.MAC) == 0 {
-			existing.LastSeen = record.LastSeen
-			existing.Alive = record.Alive
-			if len(record.Hostnames) > 0 {
-				existing.Hostnames = make([]string, len(record.Hostnames))
-				copy(existing.Hostnames, record.Hostnames)
-			}
-			if record.DNSMismatches != nil {
-				existing.DNSMismatches = make([]string, len(record.DNSMismatches))
-				copy(existing.DNSMismatches, record.DNSMismatches)
-			}
-			if len(record.OpenPorts) > 0 {
-				existing.OpenPorts = make([]uint16, len(record.OpenPorts))
-				copy(existing.OpenPorts, record.OpenPorts)
-			}
-			encoded, err := marshalHostRecord(existing)
-			if err != nil {
+		hostChange, macIPChange, applied := applyHostObservation(&existing, record)
+		if !applied {
+			change = hostChange
+			return nil
+		}
+		hostChange.Applied = true
+		if macIPChange != nil {
+			if err := appendChangeTx(tx, *macIPChange, b.maxChanges); err != nil {
 				return err
 			}
-			change = HostChange{}
-			return hBkt.Put(key, encoded)
 		}
-
-		// ---- same MAC -------------------------------------------------------
-		if bytes.Equal(existing.MAC, record.MAC) {
-			existing.LastSeen = record.LastSeen
-			if len(record.Hostnames) > 0 {
-				existing.Hostnames = make([]string, len(record.Hostnames))
-				copy(existing.Hostnames, record.Hostnames)
-			}
-			if record.DNSMismatches != nil {
-				existing.DNSMismatches = make([]string, len(record.DNSMismatches))
-				copy(existing.DNSMismatches, record.DNSMismatches)
-			}
-			if len(record.OpenPorts) > 0 {
-				existing.OpenPorts = make([]uint16, len(record.OpenPorts))
-				copy(existing.OpenPorts, record.OpenPorts)
-			}
-			existing.Vendor = record.Vendor
-			if record.AuthorizationChecked {
-				existing.AuthorizationChecked = true
-				existing.Authorized = record.Authorized
-			}
-			if record.DuplicateChecked {
-				existing.DuplicateChecked = true
-				existing.DuplicateMACs = copyDuplicateMACs(record.DuplicateMACs)
-			}
-			existing.Alive = record.Alive
-			encoded, err := marshalHostRecord(existing)
-			if err != nil {
-				return err
-			}
-			change = HostChange{DuplicateDetected: record.DuplicateChecked && len(record.DuplicateMACs) > 0}
-			return hBkt.Put(key, encoded)
-		}
-
-		// ---- MAC changed ----------------------------------------------------
-		hostChange := HostChange{
-			MACChanged: true,
-			OldMAC:     make(net.HardwareAddr, len(existing.MAC)),
-			OldVendor:  existing.Vendor,
-		}
-		copy(hostChange.OldMAC, existing.MAC)
-
-		macIPChange := MACIPChange{
-			IP:        record.IP,
-			OldMAC:    make(net.HardwareAddr, len(existing.MAC)),
-			NewMAC:    make(net.HardwareAddr, len(record.MAC)),
-			Timestamp: record.LastSeen,
-		}
-		copy(macIPChange.OldMAC, existing.MAC)
-		copy(macIPChange.NewMAC, record.MAC)
-		if err := appendChangeTx(tx, macIPChange); err != nil {
-			return err
-		}
-
-		existing.MAC = make(net.HardwareAddr, len(record.MAC))
-		copy(existing.MAC, record.MAC)
-		existing.LastSeen = record.LastSeen
-		if len(record.Hostnames) > 0 {
-			existing.Hostnames = make([]string, len(record.Hostnames))
-			copy(existing.Hostnames, record.Hostnames)
-		}
-		if record.DNSMismatches != nil {
-			existing.DNSMismatches = make([]string, len(record.DNSMismatches))
-			copy(existing.DNSMismatches, record.DNSMismatches)
-		}
-		if len(record.OpenPorts) > 0 {
-			existing.OpenPorts = make([]uint16, len(record.OpenPorts))
-			copy(existing.OpenPorts, record.OpenPorts)
-		}
-		existing.Vendor = record.Vendor
-		if record.AuthorizationChecked {
-			existing.AuthorizationChecked = true
-			existing.Authorized = record.Authorized
-		}
-		if record.DuplicateChecked {
-			existing.DuplicateChecked = true
-			existing.DuplicateMACs = copyDuplicateMACs(record.DuplicateMACs)
-		}
-		existing.Alive = record.Alive
-		existing.MACChangeCount++
-		hostChange.DuplicateDetected = record.DuplicateChecked && len(record.DuplicateMACs) > 0
-
 		encoded, err := marshalHostRecord(existing)
 		if err != nil {
 			return err
@@ -393,7 +509,10 @@ func (b *BoltStore) UpdateHost(_ context.Context, record HostRecord) (HostChange
 
 // GetHost retrieves a host record by IP address.
 // Returns nil, nil if the host is not found.
-func (b *BoltStore) GetHost(_ context.Context, ip netip.Addr) (*HostRecord, error) {
+func (b *BoltStore) GetHost(ctx context.Context, ip netip.Addr) (*HostRecord, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	var result *HostRecord
 	err := b.db.View(func(tx *bolt.Tx) error {
 		data := tx.Bucket(bucketHosts).Get([]byte(ip.String()))
@@ -402,7 +521,10 @@ func (b *BoltStore) GetHost(_ context.Context, ip netip.Addr) (*HostRecord, erro
 		}
 		r, rerr := unmarshalHostRecord(data)
 		if rerr != nil {
-			return rerr
+			return fmt.Errorf("corrupt host record %q: %w", ip, rerr)
+		}
+		if r.IP != ip {
+			return fmt.Errorf("corrupt host record %q: embedded IP is %q", ip, r.IP)
 		}
 		result = &r
 		return nil
@@ -413,58 +535,80 @@ func (b *BoltStore) GetHost(_ context.Context, ip netip.Addr) (*HostRecord, erro
 // ListHosts returns all host records within the given subnet prefix.
 // If subnet is the zero prefix, all hosts are returned.
 // Always returns a non-nil slice.
-func (b *BoltStore) ListHosts(_ context.Context, subnet netip.Prefix) ([]HostRecord, error) {
+func (b *BoltStore) ListHosts(ctx context.Context, subnet netip.Prefix) ([]HostRecord, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	result := make([]HostRecord, 0)
 	zeroPrefix := netip.Prefix{}
 	err := b.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketHosts).ForEach(func(k, v []byte) error {
-			if subnet != zeroPrefix {
-				ip, perr := netip.ParseAddr(string(k))
-				if perr != nil || !subnet.Contains(ip) {
-					return nil
-				}
+			if err := contextErr(ctx); err != nil {
+				return err
+			}
+			ip, perr := netip.ParseAddr(string(k))
+			if perr != nil {
+				return fmt.Errorf("corrupt host key %q: %w", k, perr)
+			}
+			if subnet != zeroPrefix && !subnet.Contains(ip) {
+				return nil
 			}
 			r, rerr := unmarshalHostRecord(v)
 			if rerr != nil {
-				return nil // skip corrupt records
+				return fmt.Errorf("corrupt host record %q: %w", k, rerr)
+			}
+			if r.IP != ip {
+				return fmt.Errorf("corrupt host record %q: embedded IP is %q", k, r.IP)
 			}
 			result = append(result, r)
 			return nil
 		})
 	})
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // RecordMACChange appends a MAC-IP change event to persistent storage.
-func (b *BoltStore) RecordMACChange(_ context.Context, event MACIPChange) error {
+func (b *BoltStore) RecordMACChange(ctx context.Context, event MACIPChange) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	return b.db.Update(func(tx *bolt.Tx) error {
-		return appendChangeTx(tx, event)
+		return appendChangeTx(tx, event, b.maxChanges)
 	})
 }
 
 // RecentChanges returns all MAC-IP change events at or after the given time.
-func (b *BoltStore) RecentChanges(_ context.Context, since time.Time) ([]MACIPChange, error) {
+func (b *BoltStore) RecentChanges(ctx context.Context, since time.Time) ([]MACIPChange, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	sinceNS := since.UnixNano()
 	result := make([]MACIPChange, 0)
 	err := b.db.View(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucketChanges).ForEach(func(_, v []byte) error {
+		return tx.Bucket(bucketChanges).ForEach(func(k, v []byte) error {
+			if err := contextErr(ctx); err != nil {
+				return err
+			}
 			var j macIPChangeJSON
 			if err := json.Unmarshal(v, &j); err != nil {
-				return nil // skip corrupt entries
-			}
-			if j.Timestamp < sinceNS {
-				return nil
+				return fmt.Errorf("corrupt MAC change %x: %w", k, err)
 			}
 			ip, err := netip.ParseAddr(j.IP)
 			if err != nil {
-				return nil
+				return fmt.Errorf("corrupt MAC change %x IP %q: %w", k, j.IP, err)
 			}
 			oldMAC, err := net.ParseMAC(j.OldMAC)
 			if err != nil {
-				return nil
+				return fmt.Errorf("corrupt MAC change %x old MAC %q: %w", k, j.OldMAC, err)
 			}
 			newMAC, err := net.ParseMAC(j.NewMAC)
 			if err != nil {
+				return fmt.Errorf("corrupt MAC change %x new MAC %q: %w", k, j.NewMAC, err)
+			}
+			if j.Timestamp < sinceNS {
 				return nil
 			}
 			result = append(result, MACIPChange{
@@ -476,22 +620,29 @@ func (b *BoltStore) RecentChanges(_ context.Context, since time.Time) ([]MACIPCh
 			return nil
 		})
 	})
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 // RecordScanMeta stores timing metadata for a subnet/scanner pair.
 // ErrorCount is a cumulative monotonic counter: preserved across updates,
 // incremented when meta.Error is true — matching MemoryStore semantics.
-func (b *BoltStore) RecordScanMeta(_ context.Context, meta ScanMeta) error {
+func (b *BoltStore) RecordScanMeta(ctx context.Context, meta ScanMeta) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	return b.db.Update(func(tx *bolt.Tx) error {
 		bkt := tx.Bucket(bucketScanMeta)
 		key := []byte(meta.Subnet.String() + "/" + meta.Scanner)
 
 		if existing := bkt.Get(key); existing != nil {
 			var prev scanMetaJSON
-			if err := json.Unmarshal(existing, &prev); err == nil {
-				meta.ErrorCount = prev.ErrorCount
+			if err := json.Unmarshal(existing, &prev); err != nil {
+				return fmt.Errorf("corrupt scan metadata %q: %w", key, err)
 			}
+			meta.ErrorCount = prev.ErrorCount
 		}
 		if meta.Error {
 			meta.ErrorCount++
@@ -515,21 +666,30 @@ func (b *BoltStore) RecordScanMeta(_ context.Context, meta ScanMeta) error {
 
 // GetScanMeta returns all scan metadata entries recorded for the given subnet.
 // Returns an empty slice (not an error) if no metadata has been recorded yet.
-func (b *BoltStore) GetScanMeta(_ context.Context, subnet netip.Prefix) ([]ScanMeta, error) {
+func (b *BoltStore) GetScanMeta(ctx context.Context, subnet netip.Prefix) ([]ScanMeta, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	prefix := subnet.String() + "/"
 	result := make([]ScanMeta, 0)
 	err := b.db.View(func(tx *bolt.Tx) error {
 		return tx.Bucket(bucketScanMeta).ForEach(func(k, v []byte) error {
-			key := string(k)
-			if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
-				return nil
+			if err := contextErr(ctx); err != nil {
+				return err
 			}
 			var j scanMetaJSON
 			if err := json.Unmarshal(v, &j); err != nil {
-				return nil
+				return fmt.Errorf("corrupt scan metadata %q: %w", k, err)
 			}
 			sub, err := netip.ParsePrefix(j.Subnet)
 			if err != nil {
+				return fmt.Errorf("corrupt scan metadata %q subnet %q: %w", k, j.Subnet, err)
+			}
+			key := string(k)
+			if key != j.Subnet+"/"+j.Scanner {
+				return fmt.Errorf("corrupt scan metadata %q: embedded key is %q", k, j.Subnet+"/"+j.Scanner)
+			}
+			if len(key) <= len(prefix) || key[:len(prefix)] != prefix {
 				return nil
 			}
 			result = append(result, ScanMeta{
@@ -543,5 +703,8 @@ func (b *BoltStore) GetScanMeta(_ context.Context, subnet netip.Prefix) ([]ScanM
 			return nil
 		})
 	})
-	return result, err
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }

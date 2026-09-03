@@ -5,7 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -51,10 +54,28 @@ type Sender struct {
 
 	intervalReset chan time.Duration
 
+	// unreachableAfter is fixed in production and shortened only by focused
+	// tests that exercise outage audit transitions.
+	unreachableAfter time.Duration
+
+	// lastSeries is owned by the single producer goroutine. It lets remote
+	// write explicitly mark a series stale when a subsequent gather no longer
+	// emits it. It is advanced only after a batch has been acknowledged by the
+	// receiver, so dropped batches retain their stale obligations.
+	seriesMu    sync.Mutex
+	lastSeries  map[string][]prompb.Label
+	deliveryGen uint64 // guarded by cfgMu; changes when endpoint changes
+	// deliveryEndpoints retains the label value for a generation long enough
+	// to attribute an in-flight old-destination drop correctly after reload.
+	deliveryEndpoints map[uint64]string // guarded by cfgMu
+
 	// Cancellation hook for the in-flight HTTP request. Set by the consumer
 	// goroutine and called by Reload to abort an in-progress send when
 	// endpoint or auth changes. Guarded by cfgMu.
 	cancelInFlight context.CancelFunc
+
+	// beforeSend is a test synchronization hook. It is nil in production.
+	beforeSend func()
 }
 
 // NewSender constructs a Sender. The HTTP client is built immediately so
@@ -74,15 +95,18 @@ func NewSender(cfg Config, gatherer prometheus.Gatherer, metrics *Metrics, logge
 		auditLog = audit.Disabled()
 	}
 	return &Sender{
-		cfg:           cfg,
-		gatherer:      gatherer,
-		client:        client,
-		queue:         NewQueue(cfg.Queue.MaxSamples),
-		metrics:       metrics,
-		logger:        logger,
-		auditLog:      auditLog,
-		version:       version,
-		intervalReset: make(chan time.Duration, 1),
+		cfg:               cloneConfig(cfg),
+		gatherer:          gatherer,
+		client:            client,
+		queue:             NewQueue(cfg.Queue.MaxSamples),
+		metrics:           metrics,
+		logger:            logger,
+		auditLog:          auditLog,
+		version:           version,
+		intervalReset:     make(chan time.Duration, 1),
+		lastSeries:        make(map[string][]prompb.Label),
+		deliveryEndpoints: map[uint64]string{0: cfg.Endpoint},
+		unreachableAfter:  unreachableThreshold,
 	}, nil
 }
 
@@ -125,8 +149,6 @@ func (s *Sender) runProducer(ctx context.Context) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	endpoint := s.Endpoint()
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -134,22 +156,25 @@ func (s *Sender) runProducer(ctx context.Context) {
 		case newInterval := <-s.intervalReset:
 			ticker.Reset(newInterval)
 		case <-ticker.C:
-			s.produceOnce(endpoint)
+			s.produceOnce()
 		}
 	}
 }
 
-func (s *Sender) produceOnce(endpoint string) {
+func (s *Sender) produceOnce() {
 	families, err := s.gatherer.Gather()
 	if err != nil {
 		s.logger.Warn("remote write: gather failed", "err", err)
 		return
 	}
 
+	// Keep the config read lock from snapshot through enqueue. A reload then
+	// either drains this old-destination batch, or this producer observes the
+	// new destination before it can enqueue anything.
 	s.cfgMu.RLock()
+	endpoint := s.cfg.Endpoint
 	extLabels := s.cfg.ExternalLabels
-	s.cfgMu.RUnlock()
-
+	generation := s.deliveryGen
 	wr, convErr := Convert(families, extLabels, time.Now().UnixMilli())
 	if convErr != nil {
 		// Convert reports the first collision; we count one sample per
@@ -157,16 +182,89 @@ func (s *Sender) produceOnce(endpoint string) {
 		// non-zero counter. The caller log is more useful than the metric here.
 		s.metrics.SamplesDropped.WithLabelValues(endpoint, "conversion_error").Inc()
 		s.logger.Warn("remote write: conversion error", "err", convErr)
-	}
-
-	if wr == nil || len(wr.Timeseries) == 0 {
+		s.cfgMu.RUnlock()
 		return
 	}
-	dropped := s.queue.Push(wr)
+
+	if wr == nil {
+		s.cfgMu.RUnlock()
+		return
+	}
+	dropped := s.queue.PushWithGeneration(wr, generation)
 	if dropped > 0 {
 		s.metrics.SamplesDropped.WithLabelValues(endpoint, "queue_full").Add(float64(dropped))
 	}
 	s.metrics.QueueSize.WithLabelValues(endpoint).Set(float64(s.queue.Len()))
+	s.cfgMu.RUnlock()
+}
+
+// prometheusStaleNaN is the exact IEEE-754 payload Prometheus uses for a
+// staleness marker. A generic NaN must not be used: receivers distinguish this
+// payload from an invalid sample.
+var prometheusStaleNaN = math.Float64frombits(0x7ff0000000000002)
+
+func (s *Sender) addStaleMarkers(wr *prompb.WriteRequest, timestamp int64) {
+	if wr == nil {
+		wr = &prompb.WriteRequest{}
+	}
+	current := make(map[string][]prompb.Label, len(wr.Timeseries))
+	for i := range wr.Timeseries {
+		labels := wr.Timeseries[i].Labels
+		current[seriesKey(labels)] = append([]prompb.Label(nil), labels...)
+	}
+	s.seriesMu.Lock()
+	defer s.seriesMu.Unlock()
+	for key, labels := range s.lastSeries {
+		if _, stillPresent := current[key]; stillPresent {
+			continue
+		}
+		wr.Timeseries = append(wr.Timeseries, prompb.TimeSeries{
+			Labels:  append([]prompb.Label(nil), labels...),
+			Samples: []prompb.Sample{{Value: prometheusStaleNaN, Timestamp: timestamp}},
+		})
+	}
+}
+
+// acknowledgeSeries records the exact non-stale label sets contained in a
+// successfully delivered batch. This is intentionally consumer-owned: a
+// queue overflow or endpoint reload must not erase a marker that never made
+// it to a receiver.
+func (s *Sender) acknowledgeSeries(wr *prompb.WriteRequest) {
+	current := make(map[string][]prompb.Label, len(wr.Timeseries))
+	for _, ts := range wr.Timeseries {
+		if staleOnly(ts.Samples) {
+			continue
+		}
+		current[seriesKey(ts.Labels)] = append([]prompb.Label(nil), ts.Labels...)
+	}
+	s.seriesMu.Lock()
+	s.lastSeries = current
+	s.seriesMu.Unlock()
+}
+
+func staleOnly(samples []prompb.Sample) bool {
+	if len(samples) == 0 {
+		return false
+	}
+	for _, sample := range samples {
+		if math.Float64bits(sample.Value) != math.Float64bits(prometheusStaleNaN) {
+			return false
+		}
+	}
+	return true
+}
+
+func seriesKey(labels []prompb.Label) string {
+	var b strings.Builder
+	for _, label := range labels {
+		b.WriteString(strconv.Itoa(len(label.Name)))
+		b.WriteByte(':')
+		b.WriteString(label.Name)
+		b.WriteString(strconv.Itoa(len(label.Value)))
+		b.WriteByte(':')
+		b.WriteString(label.Value)
+	}
+	return b.String()
 }
 
 // runConsumer pops one batch at a time. Single-flight to keep semantics
@@ -174,42 +272,97 @@ func (s *Sender) produceOnce(endpoint string) {
 // in-flight request. Receivers cope with this; Mimir/Cortex/Thanos all
 // document expected throughput in samples/sec, not concurrent requests.
 func (s *Sender) runConsumer(ctx context.Context) {
-	endpoint := s.Endpoint()
 	backoff := initialBackoff
 	var inFlight *prompb.WriteRequest
+	var inFlightGeneration uint64
 	var firstFailure time.Time
-	var lastErrMsg string
 	startedLogged := false
+	unreachableLogged := false
+	observabilityGeneration := uint64(0)
 
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		if inFlight == nil {
-			req, ok := s.queue.PopWithContext(ctx)
+			req, generation, ok := s.queue.PopWithGeneration(ctx)
 			if !ok {
 				return
 			}
+			// Staleness is a receiver-side transition, so compute it against
+			// the last batch that this single consumer actually acknowledged.
+			// Doing this in the producer is incorrect when multiple snapshots
+			// queue ahead of delivery: an intermediate series could otherwise
+			// appear at the receiver and never receive a stale marker.
+			s.addStaleMarkers(req, time.Now().UnixMilli())
+			if len(req.Timeseries) == 0 {
+				// An empty snapshot is queued as a control item so disappearance
+				// can be evaluated here. With no acknowledged series to retire,
+				// there is nothing to send.
+				continue
+			}
 			inFlight = req
+			inFlightGeneration = generation
 		}
 		samples := countSamples(inFlight)
 
-		s.cfgMu.RLock()
-		timeout := s.cfg.Timeout
-		s.cfgMu.RUnlock()
-
-		sendCtx, cancel := context.WithTimeout(ctx, timeout)
+		// Snapshotting a client and registering its cancellation hook must be
+		// one exclusive operation. Otherwise Reload could publish a new client
+		// in between and return while this consumer still starts an uncancelled
+		// request with old credentials or endpoint.
 		s.cfgMu.Lock()
+		timeout := s.cfg.Timeout
+		client := s.client
+		endpoint := client.endpoint
+		activeGeneration := s.deliveryGen
+		if activeGeneration != observabilityGeneration {
+			firstFailure = time.Time{}
+			startedLogged = false
+			unreachableLogged = false
+			observabilityGeneration = activeGeneration
+		}
+		if inFlightGeneration != activeGeneration {
+			dropEndpoint := s.deliveryEndpoints[inFlightGeneration]
+			s.cfgMu.Unlock()
+			if dropEndpoint == "" {
+				dropEndpoint = endpoint
+			}
+			s.metrics.SamplesDropped.WithLabelValues(dropEndpoint, "endpoint_changed").Add(float64(samples))
+			s.metrics.QueueSize.WithLabelValues(endpoint).Set(float64(s.queue.Len()))
+			inFlight = nil
+			continue
+		}
+		beforeSend := s.beforeSend
+		sendCtx, cancel := context.WithTimeout(ctx, timeout)
 		s.cancelInFlight = cancel
 		s.cfgMu.Unlock()
+		if beforeSend != nil {
+			beforeSend()
+		}
 
 		started := time.Now()
-		err := s.client.Send(sendCtx, inFlight)
+		err := client.Send(sendCtx, inFlight)
 		duration := time.Since(started).Seconds()
 		cancel()
 		s.cfgMu.Lock()
+		staleGeneration := inFlightGeneration != s.deliveryGen
+		dropEndpoint := s.deliveryEndpoints[inFlightGeneration]
+		currentGeneration := s.deliveryGen
 		s.cancelInFlight = nil
 		s.cfgMu.Unlock()
+		if staleGeneration {
+			if dropEndpoint == "" {
+				dropEndpoint = endpoint
+			}
+			s.metrics.SamplesDropped.WithLabelValues(dropEndpoint, "endpoint_changed").Add(float64(samples))
+			s.metrics.QueueSize.WithLabelValues(endpoint).Set(float64(s.queue.Len()))
+			firstFailure = time.Time{}
+			startedLogged = false
+			unreachableLogged = false
+			observabilityGeneration = currentGeneration
+			inFlight = nil
+			continue
+		}
 
 		s.metrics.SendDuration.WithLabelValues(endpoint).Observe(duration)
 
@@ -217,22 +370,21 @@ func (s *Sender) runConsumer(ctx context.Context) {
 			s.metrics.SamplesSent.WithLabelValues(endpoint).Add(float64(samples))
 			s.metrics.LastSuccess.WithLabelValues(endpoint).SetToCurrentTime()
 			s.metrics.QueueSize.WithLabelValues(endpoint).Set(float64(s.queue.Len()))
+			s.acknowledgeSeries(inFlight)
 
 			if !startedLogged {
-				s.cfgMu.RLock()
-				authType := s.cfg.Auth.Type
-				s.cfgMu.RUnlock()
+				authType := client.auth.Type
 				if authType == "" {
 					authType = "mtls"
 				}
 				s.auditLog.RemoteWriteStarted(endpoint, authType)
 				startedLogged = true
 			}
-			if !firstFailure.IsZero() && time.Since(firstFailure) >= unreachableThreshold {
+			if unreachableLogged {
 				s.auditLog.RemoteWriteRecovered(endpoint, time.Since(firstFailure))
 			}
 			firstFailure = time.Time{}
-			lastErrMsg = ""
+			unreachableLogged = false
 			inFlight = nil
 			backoff = initialBackoff
 			continue
@@ -253,10 +405,10 @@ func (s *Sender) runConsumer(ctx context.Context) {
 		s.metrics.Failures.WithLabelValues(endpoint, classifyFailure(err)).Inc()
 		if firstFailure.IsZero() {
 			firstFailure = time.Now()
-		} else if time.Since(firstFailure) >= unreachableThreshold && lastErrMsg != err.Error() {
+		} else if !unreachableLogged && time.Since(firstFailure) >= s.unreachableAfter {
 			s.auditLog.RemoteWriteEndpointUnreachable(endpoint, time.Since(firstFailure), err.Error())
+			unreachableLogged = true
 		}
-		lastErrMsg = err.Error()
 		s.logger.Warn("remote write: send failed; will retry",
 			"err", err, "backoff", backoff)
 
@@ -265,10 +417,12 @@ func (s *Sender) runConsumer(ctx context.Context) {
 		if errors.As(err, &se) && se.RetryAfter > 0 {
 			sleep = se.RetryAfter
 		}
+		retryTimer := time.NewTimer(sleep)
 		select {
 		case <-ctx.Done():
+			retryTimer.Stop()
 			return
-		case <-time.After(sleep):
+		case <-retryTimer.C:
 		}
 		if backoff < maxBackoff {
 			backoff *= 2
@@ -336,14 +490,15 @@ func indexOf(s, sub string) int {
 // runtime — see ErrEnableToggleRequiresRestart.
 //
 // Endpoint or auth change rebuilds the client and cancels the in-flight
-// request so the next iteration uses the new credentials.
+// request so the next iteration uses the new credentials. Certificate and
+// credential files are also re-read on every SIGHUP, even when their paths
+// are unchanged, so atomic secret/certificate rotation works as documented.
 //
 // Interval changes are signalled to the producer via a buffered channel.
-// Queue capacity changes apply only to future pushes; existing contents
-// are not redistributed.
+// Queue capacity changes take effect immediately. If capacity is reduced,
+// oldest queued payloads are evicted until the queue fits the new limit.
 //
-// External label changes naturally take effect on the next produce cycle
-// because the producer reads cfg under the read-lock.
+// External label changes naturally take effect on the next produce cycle.
 func (s *Sender) Reload(newCfg Config) error {
 	s.cfgMu.Lock()
 	defer s.cfgMu.Unlock()
@@ -352,15 +507,19 @@ func (s *Sender) Reload(newCfg Config) error {
 		return ErrEnableToggleRequiresRestart
 	}
 
+	newCfg = cloneConfig(newCfg)
 	changes := diffConfig(s.cfg, newCfg)
-	if len(changes) == 0 {
-		return nil
-	}
+	oldEndpoint := s.cfg.Endpoint
+	endpointChanged := oldEndpoint != newCfg.Endpoint
 
-	// Endpoint or mTLS material change → full client rebuild.
-	rebuildClient := s.cfg.Endpoint != newCfg.Endpoint ||
+	// Clients are immutable after construction. Publishing a complete new
+	// client prevents races with Send and means a failed credential rotation
+	// leaves both the old client and old config active.
+	rebuildClient := endpointChanged ||
 		!authMaterialEqual(s.cfg.Auth, newCfg.Auth) ||
-		s.cfg.Timeout != newCfg.Timeout
+		s.cfg.Timeout != newCfg.Timeout ||
+		newCfg.Auth.Type == "mtls" || newCfg.Auth.Type == "" ||
+		newCfg.Auth.Type == "bearer" || newCfg.Auth.Type == "basic"
 
 	if rebuildClient {
 		newClient, err := NewClient(newCfg, s.version)
@@ -371,30 +530,59 @@ func (s *Sender) Reload(newCfg Config) error {
 			s.cancelInFlight()
 		}
 		s.client = newClient
-	} else if s.cfg.Auth.Type == newCfg.Auth.Type && newCfg.Auth.Type == "bearer" {
-		// Bearer-token rotation: the token file content might have changed
-		// even though the path didn't.
-		if err := s.client.ReloadAuth(newCfg.Auth); err != nil {
-			s.logger.Warn("remote write: reload auth failed; retaining previous credentials", "err", err)
+	}
+	if endpointChanged {
+		// Never forward data produced for one receiver/tenant to another. The
+		// consumer generation check covers an item already popped while this
+		// reload waited for cfgMu; Clear covers everything still buffered.
+		s.deliveryGen++
+		s.deliveryEndpoints[s.deliveryGen] = newCfg.Endpoint
+		if dropped := s.queue.Clear(); dropped > 0 {
+			s.metrics.SamplesDropped.WithLabelValues(oldEndpoint, "endpoint_changed").Add(float64(dropped))
 		}
+		s.metrics.QueueSize.WithLabelValues(oldEndpoint).Set(0)
+		s.seriesMu.Lock()
+		s.lastSeries = make(map[string][]prompb.Label)
+		s.seriesMu.Unlock()
 	}
 
 	if s.cfg.Interval != newCfg.Interval {
+		// Keep only the newest requested interval. A plain non-blocking send
+		// would retain an older reset when SIGHUP arrives in a burst.
 		select {
-		case s.intervalReset <- newCfg.Interval:
+		case <-s.intervalReset:
 		default:
-			// Channel buffered size 1; a pending reset is fine — newest wins
-			// when the producer picks it up.
 		}
+		s.intervalReset <- newCfg.Interval
 	}
 	if s.cfg.Queue.MaxSamples != newCfg.Queue.MaxSamples {
-		s.logger.Warn("remote write: queue capacity changed; existing entries are not redistributed",
-			"old", s.cfg.Queue.MaxSamples, "new", newCfg.Queue.MaxSamples)
+		dropped := s.queue.SetCapacity(newCfg.Queue.MaxSamples)
+		if dropped > 0 {
+			s.metrics.SamplesDropped.WithLabelValues(newCfg.Endpoint, "queue_full").Add(float64(dropped))
+		}
+		s.metrics.QueueSize.WithLabelValues(newCfg.Endpoint).Set(float64(s.queue.Len()))
 	}
 
 	s.cfg = newCfg
-	s.auditLog.RemoteWriteConfigReloaded(changes)
+	if len(changes) > 0 {
+		s.auditLog.RemoteWriteConfigReloaded(changes)
+	}
 	return nil
+}
+
+// cloneConfig detaches a Sender's immutable configuration snapshot from the
+// YAML decoder and callers. In particular, maps must not be shared with the
+// producer goroutine because Convert iterates external labels.
+func cloneConfig(cfg Config) Config {
+	if cfg.ExternalLabels == nil {
+		return cfg
+	}
+	labels := make(map[string]string, len(cfg.ExternalLabels))
+	for k, v := range cfg.ExternalLabels {
+		labels[k] = v
+	}
+	cfg.ExternalLabels = labels
+	return cfg
 }
 
 // diffConfig returns a sorted list of human-readable change descriptions.

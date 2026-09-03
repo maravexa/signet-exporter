@@ -4,10 +4,14 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/maravexa/signet-exporter/internal/audit"
 	"github.com/maravexa/signet-exporter/internal/state"
 )
 
@@ -42,7 +46,16 @@ type concurrencyTrackingScanner struct {
 	delay   time.Duration
 }
 
-func (c *concurrencyTrackingScanner) Name() string { return "concurrency-tracker" }
+type rejectAuthorizationStore struct{ state.Store }
+
+func (s rejectAuthorizationStore) UpdateHost(ctx context.Context, record state.HostRecord) (state.HostChange, error) {
+	if record.Source == state.SourceAuthorization {
+		return state.HostChange{}, nil
+	}
+	return s.Store.UpdateHost(ctx, record)
+}
+
+func (c *concurrencyTrackingScanner) Name() string { return "arp" }
 
 func (c *concurrencyTrackingScanner) Scan(ctx context.Context, _ netip.Prefix) ([]ScanResult, error) {
 	current := c.active.Add(1)
@@ -85,7 +98,7 @@ func makeScanResult(ip, mac string) ScanResult {
 		IP:        netip.MustParseAddr(ip),
 		MAC:       hw,
 		Alive:     true,
-		Source:    "mock",
+		Source:    "arp",
 		Timestamp: time.Now(),
 	}
 }
@@ -204,9 +217,12 @@ func TestScheduler_ScanError_Continues(t *testing.T) {
 	defer cancel()
 
 	go func() { _ = sched.Run(runCtx) }()
-	waitReady(t, sched, 5*time.Second)
-
-	time.Sleep(200 * time.Millisecond)
+	// A failed discovery cycle is not a usable readiness signal.
+	select {
+	case <-sched.Ready():
+		t.Fatal("scheduler became ready after only failed discovery scans")
+	case <-time.After(150 * time.Millisecond):
+	}
 	cancel()
 
 	calls := mock.calls.Load()
@@ -257,6 +273,158 @@ func TestScheduler_ContextCancellation(t *testing.T) {
 		// Run returned promptly — correct.
 	case <-time.After(3 * time.Second):
 		t.Fatal("Run did not return within 3s after context cancellation")
+	}
+}
+
+func TestScheduler_PrunesExpiredHostsBeforeFirstScan(t *testing.T) {
+	store := state.NewMemoryStore()
+	subnet := makeSubnetConfig("10.5.1.0/24", time.Hour)
+	old := time.Now().Add(-2 * time.Hour)
+	_, err := store.UpdateHost(context.Background(), state.HostRecord{
+		IP:       netip.MustParseAddr("10.5.1.10"),
+		LastSeen: old,
+		Alive:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The scanner's first result is intentionally empty: a stale persisted host
+	// must be removed before the normal scan/readiness path begins.
+	mock := &mockScanner{name: "arp"}
+	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{subnet}, 1, nil, nil, nil, nil, time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = sched.Run(ctx) }()
+	waitReady(t, sched, 5*time.Second)
+
+	host, err := store.GetHost(context.Background(), netip.MustParseAddr("10.5.1.10"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != nil {
+		t.Fatalf("expired host remained after scheduler startup: %+v", host)
+	}
+}
+
+func TestScheduler_NormalizesDuplicateAndOverlappingSubnets(t *testing.T) {
+	store := state.NewMemoryStore()
+	mock := &mockScanner{name: "arp"}
+	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{
+		makeSubnetConfig("10.5.2.0/24", time.Hour),
+		makeSubnetConfig("10.5.2.42/24", time.Hour), // canonical duplicate
+		makeSubnetConfig("10.5.0.0/16", time.Hour),  // overlap
+	}, 2, nil, nil, nil, nil, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = sched.Run(ctx) }()
+	waitReady(t, sched, 5*time.Second)
+	if got := mock.calls.Load(); got != 1 {
+		t.Fatalf("duplicate/overlap normalization ran %d scans, want 1", got)
+	}
+}
+
+func TestScheduler_ConcurrentReloadStartsOneWorkerPerNewSubnet(t *testing.T) {
+	store := state.NewMemoryStore()
+	tracker := &concurrencyTrackingScanner{delay: 30 * time.Millisecond}
+	sched := NewScheduler([]Scanner{tracker}, store, nil, 4, nil, nil, nil, nil, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = sched.Run(ctx) }()
+	waitReady(t, sched, 5*time.Second) // empty initial config is immediately ready
+
+	params := ApplyConfigParams{Subnets: []SubnetConfig{makeSubnetConfig("10.5.3.0/24", time.Hour)}}
+	const reloads = 12
+	done := make(chan struct{}, reloads)
+	for i := 0; i < reloads; i++ {
+		go func() {
+			sched.ApplyConfig(params)
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < reloads; i++ {
+		<-done
+	}
+
+	deadline := time.After(2 * time.Second)
+	for tracker.maxSeen.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("reloaded subnet was never scanned")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	// Reload wakes the worker to re-snapshot, so it may run more than once. Its
+	// peak concurrency must nevertheless remain one for the added prefix.
+	time.Sleep(75 * time.Millisecond)
+	if got := tracker.maxSeen.Load(); got != 1 {
+		t.Fatalf("new subnet peak concurrency = %d, want one worker", got)
+	}
+}
+
+func TestScheduler_ApplyConfigBeforeAndAfterRunDoesNotDeadlock(t *testing.T) {
+	sched := NewScheduler(nil, state.NewMemoryStore(), nil, 1, nil, nil, nil, nil, 0)
+	params := ApplyConfigParams{Subnets: []SubnetConfig{makeSubnetConfig("10.5.4.0/24", time.Hour)}}
+	sched.ApplyConfig(params) // before Run must release the configuration lock
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_ = sched.Run(ctx)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduler did not stop")
+	}
+
+	after := make(chan struct{})
+	go func() {
+		sched.ApplyConfig(params) // after shutdown must also release the lock
+		close(after)
+	}()
+	select {
+	case <-after:
+	case <-time.After(time.Second):
+		t.Fatal("ApplyConfig deadlocked after scheduler shutdown")
+	}
+}
+
+func TestScheduler_ReloadWakesIntervalAndRemoval(t *testing.T) {
+	store := state.NewMemoryStore()
+	prefix := makeSubnetConfig("10.5.5.0/24", time.Hour)
+	mock := &mockScanner{name: "arp"}
+	sched := NewScheduler([]Scanner{mock}, store, []SubnetConfig{prefix}, 1, nil, nil, nil, nil, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = sched.Run(ctx) }()
+	waitReady(t, sched, time.Second)
+
+	sched.ApplyConfig(ApplyConfigParams{Subnets: []SubnetConfig{makeSubnetConfig("10.5.5.0/24", time.Millisecond)}})
+	deadline := time.After(time.Second)
+	for mock.calls.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("shorter reload interval did not wake the worker")
+		case <-time.After(time.Millisecond):
+		}
+	}
+
+	sched.ApplyConfig(ApplyConfigParams{})
+	for {
+		sched.mu.RLock()
+		workers := len(sched.workers)
+		sched.mu.RUnlock()
+		if workers == 0 {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("removed subnet worker did not exit promptly")
+		case <-time.After(time.Millisecond):
+		}
 	}
 }
 
@@ -341,6 +509,109 @@ func TestScheduler_WritesToStore(t *testing.T) {
 	}
 	if metas[0].Timestamp.IsZero() {
 		t.Error("timestamp is zero")
+	}
+}
+
+func TestScheduler_MapsDNSResultToSourceOwnedObservation(t *testing.T) {
+	store := state.NewMemoryStore()
+	subnet := makeSubnetConfig("10.7.1.0/24", time.Hour)
+	ip := netip.MustParseAddr("10.7.1.1")
+	oldSeen := time.Now().Add(-time.Hour).Round(0)
+	_, err := store.UpdateHost(context.Background(), state.HostRecord{
+		IP:         ip,
+		Source:     state.SourceARP,
+		ObservedAt: oldSeen,
+		LastSeen:   oldSeen,
+		Alive:      false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	newDNSAt := time.Now().Round(0)
+	dns := &mockScanner{name: "dns", results: []ScanResult{{
+		IP:            ip,
+		Alive:         true, // scheduler must not let this refresh liveness
+		Source:        "dns",
+		Timestamp:     newDNSAt,
+		Hostnames:     []string{"host.example"},
+		DNSMismatches: []string{},
+	}}}
+	sched := NewScheduler([]Scanner{dns}, store, []SubnetConfig{subnet}, 1, nil, nil, nil, nil, 0)
+	sched.scanSubnet(context.Background(), scanCycle{subnet: subnet})
+
+	host, err := store.GetHost(context.Background(), ip)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host == nil {
+		t.Fatal("host unexpectedly missing")
+	}
+	if host.Alive || !host.LastSeen.Equal(oldSeen) {
+		t.Errorf("DNS result refreshed liveness: Alive=%t LastSeen=%s", host.Alive, host.LastSeen)
+	}
+	if host.DNSObservedAt != newDNSAt || len(host.Hostnames) != 1 || host.Hostnames[0] != "host.example" {
+		t.Errorf("DNS observation was not source-owned as expected: %+v", host)
+	}
+}
+
+func TestScheduler_DoesNotAuditRejectedAuthorizationObservation(t *testing.T) {
+	ctx := context.Background()
+	base := state.NewMemoryStore()
+	prefix := netip.MustParsePrefix("10.7.3.0/24")
+	if _, err := base.UpdateHost(ctx, state.HostRecord{
+		IP:         netip.MustParseAddr("10.7.3.1"),
+		MAC:        net.HardwareAddr{0, 1, 2, 3, 4, 5},
+		Source:     state.SourceARP,
+		ObservedAt: time.Now(),
+		Alive:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	allowlistPath := filepath.Join(t.TempDir(), "allowlist.txt")
+	if err := os.WriteFile(allowlistPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	allowlist, err := LoadAllowlist(allowlistPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auditPath := filepath.Join(t.TempDir(), "audit.jsonl")
+	auditLog, err := audit.NewLogger(audit.Config{Enabled: true, Output: auditPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sched := NewScheduler(nil, rejectAuthorizationStore{Store: base}, []SubnetConfig{{Prefix: prefix, ScanInterval: time.Hour}}, 1, nil, nil, auditLog, nil, 0)
+	sched.checkAuthorization(ctx, SubnetConfig{Prefix: prefix, ScanInterval: time.Hour}, allowlist, 1)
+	if err := auditLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(auditPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), string(audit.EventUnauthorizedDevice)) {
+		t.Fatalf("rejected authorization observation produced an audit event: %s", data)
+	}
+}
+
+func TestScheduler_DropsUnknownObservationSource(t *testing.T) {
+	store := state.NewMemoryStore()
+	subnet := makeSubnetConfig("10.7.2.0/24", time.Hour)
+	bad := &mockScanner{name: "arp", results: []ScanResult{{
+		IP:        netip.MustParseAddr("10.7.2.1"),
+		Alive:     true,
+		Source:    "malicious-extension",
+		Timestamp: time.Now(),
+	}}}
+	sched := NewScheduler([]Scanner{bad}, store, []SubnetConfig{subnet}, 1, nil, nil, nil, nil, 0)
+	sched.scanSubnet(context.Background(), scanCycle{subnet: subnet})
+	host, err := store.GetHost(context.Background(), netip.MustParseAddr("10.7.2.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != nil {
+		t.Fatalf("unsupported observation source mutated state: %+v", host)
 	}
 }
 

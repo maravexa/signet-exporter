@@ -7,16 +7,16 @@
 
 ---
 
-Most network inventory tools were built for IT operations, not compliance. They assume a CMDB, a change-management process, and a team whose primary concern is uptime — not an auditor asking whether every device on your OT subnet is known and authorized. ARP-level visibility sounds basic, but no existing Prometheus exporter ties raw MAC-to-IP binding data to allowlist enforcement, rogue device detection, and a structured audit trail in a single deployable binary. Signet fills that gap: it brings Layer 2 inventory into your existing Prometheus/Grafana stack with the security controls that compliance environments require — mTLS, FIPS-validated crypto, least-privilege operation, and signed releases with a verifiable SBOM.
+Most network inventory tools were built for IT operations, not compliance. They assume a CMDB, a change-management process, and a team whose primary concern is uptime — not an auditor asking whether every device on your OT subnet is known and authorized. ARP-level visibility sounds basic, but no existing Prometheus exporter ties raw MAC-to-IP binding data to allowlist enforcement, rogue device detection, and a structured audit trail in a single deployable binary. Signet brings Layer 2 inventory into your existing Prometheus/Grafana stack with mTLS, least-privilege operation, an optional BoringCrypto build, signed release checksums, and generated SBOMs.
 
 ## Security Posture
 
 | Control | Implementation |
 |---------|---------------|
 | Transport security | mTLS with TLS 1.3 minimum; `client_ca_file` enforces mutual authentication |
-| FIPS 140-2 | Alternate build target with `GOEXPERIMENT=boringcrypto` |
+| BoringCrypto build | Alternate build target with `GOEXPERIMENT=boringcrypto`; CI verifies build symbols and runtime detection |
 | Least privilege | Runs as dedicated `signet` system user; only `CAP_NET_RAW` granted |
-| Supply chain | Signed releases via cosign (Sigstore); CycloneDX SBOM attached to every release |
+| Supply chain | Release checksum manifest is signed with keyless cosign; CycloneDX SBOM assets are generated and uploaded |
 | Audit logging | Structured JSON audit records for all binding changes and rogue device detections |
 | Root refusal | Process exits immediately if launched as UID 0 |
 | Bind safety | Default listen address is `127.0.0.1`; binding to `0.0.0.0` is rejected at validation |
@@ -32,9 +32,9 @@ Most network inventory tools were built for IT operations, not compliance. They 
 - **DNS forward/reverse consistency** — flags mismatches between A and PTR records
 - **TCP port probing** — lightweight connect scan on configurable per-subnet port lists
 - **MAC OUI vendor enrichment** — resolves IEEE OUI prefix to vendor name
-- **Rogue device detection** — compares observed MACs against per-subnet allowlists
+- **Rogue device detection** — compares observed MACs against per-subnet inventory/compliance allowlists; it does not authenticate devices or control network access
 - **Persistent state** — optional bbolt backend survives restarts; memory backend for ephemeral use
-- **FIPS build variant** — BoringCrypto TLS for FIPS 140-2 environments
+- **BoringCrypto build variant** — a build option for environments that require it; assess certification requirements with your compliance owner
 
 ---
 
@@ -90,7 +90,7 @@ Edit `/etc/signet/signet.yaml` to add your subnets before starting.
 # Standard binary
 make build
 
-# FIPS variant (requires Go toolchain with BoringCrypto support)
+# BoringCrypto variant (requires Go toolchain with BoringCrypto support)
 make build-fips
 ```
 
@@ -142,7 +142,8 @@ Key fields:
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `signet_host_up` | Gauge | `ip, mac, vendor, subnet` | 1 if host responded in last scan |
+| `signet_host_up` | Gauge | `ip, subnet` | 1 after a recent successful ARP/ICMP presence observation (within 3× the subnet scan interval) |
+| `signet_host_info` | Gauge | `ip, mac, vendor, hostname, subnet` | Last-known host enrichment; value is always 1 |
 | `signet_scan_duration_seconds` | Gauge | `subnet, scanner` | Duration of most recent scan |
 | `signet_last_scan_timestamp` | Gauge | `subnet` | Unix timestamp of last completed scan |
 | `signet_duplicate_ip_detected` | Gauge | `ip, subnet` | 1 if duplicate IP observed |
@@ -151,9 +152,10 @@ Key fields:
 | `signet_subnet_addresses_used` | Gauge | `subnet` | Active addresses in subnet |
 | `signet_subnet_addresses_total` | Gauge | `subnet` | Total usable addresses in subnet |
 | `signet_unauthorized_device_detected` | Gauge | `ip, mac, vendor, subnet` | 1 if device not in allowlist |
-| `signet_port_open` | Gauge | `ip, port, subnet` | 1 if TCP port was open in last scan |
+| `signet_port_open` | Gauge | `ip, port, subnet` | 1 for an open TCP port observed by the active configuration generation |
 | `signet_scan_errors_total` | Counter | `subnet, scanner` | Total scan errors |
 | `signet_exporter_build_info` | Gauge | `version, commit, goversion` | Build metadata |
+| `signet_active_series_estimate` | Gauge | — | Exact number of series emitted by Signet's inventory collector (excluding Go, process, and remote-write self-metrics) |
 
 ---
 
@@ -188,7 +190,7 @@ capability setting needed when running as a service.
 ## OUI Vendor Database
 
 Signet resolves MAC address prefixes to manufacturer names using the IEEE OUI database.
-This populates the `vendor` label on `signet_host_up` metrics.
+This populates the `vendor` label on `signet_host_info` metrics.
 
 ### Configuration
 
@@ -240,7 +242,7 @@ For automated updates, add a cron entry or systemd timer:
 | Target | Sudo | Description |
 |---|---|---|
 | `make build` | No | Build the binary to `dist/` |
-| `make build-fips` | No | Build the FIPS 140-2 variant |
+| `make build-fips` | No | Build the BoringCrypto variant |
 | `make test` | No | Run tests with race detector |
 | `make vet` | No | Run `go vet` |
 | `make lint` | No | Run `golangci-lint` |
@@ -309,6 +311,10 @@ MIT [LICENSE](LICENSE).
 ## mTLS
 
 Signet supports mutual TLS (mTLS) so that only authenticated Prometheus scrapers can reach `/metrics`. This satisfies SC-8 (Transmission Confidentiality and Integrity) in NIST 800-53 / FedRAMP environments.
+
+TLS client authentication happens before HTTP routing, so the same mTLS policy
+also protects the server's health and readiness endpoints. Do not expose a
+separate plaintext listener if those endpoints must remain private.
 
 ### Dev quickstart — generate a cert chain
 
@@ -395,16 +401,9 @@ Operational reference material lives under `docs/`. The most useful entry points
 
 ## Grafana Dashboard
 
-A pre-built Grafana dashboard is included in [`grafana/signet-overview.json`](grafana/signet-overview.json).
-
-See [`grafana/README.md`](grafana/README.md) for import instructions (UI upload or provisioning) and full details.
-
-The dashboard covers:
-
-- **Host Inventory** — live host counts and MAC-IP binding table
-- **Scan Performance** — ARP, ICMP, DNS, and port scan durations
-- **Subnet Utilization** — address space usage per subnet
-- **Security Alerts** — unauthorized devices, duplicate IPs, and DNS mismatches
+[`grafana/signet-overview.json`](grafana/signet-overview.json) is currently a
+placeholder, not an importable dashboard. Use the metric reference and PromQL
+examples below to build a dashboard for your environment.
 
 
 ---
@@ -484,15 +483,21 @@ Signet is a network inventory tool, not a vulnerability scanner. The port scan l
 | /24 | 254 | ~100 | ~600 | Trivially fine |
 | /20 | 4,094 | ~1,600 | ~8K | Fine |
 | /16 | 65,534 | ~26K | ~120K | Fine on standard Prometheus |
-| /14 | 262,142 | ~105K | ~500K | Approaching limits; plan for federation |
-| /12 | 1,048,574 | ~419K | ~2M | Single Prometheus not recommended |
-| /10 and larger | — | — | — | Requires federation or Thanos/Cortex |
 
-The `signet_active_series_estimate` metric in `/metrics` gives a real-time estimate based on actual host count and configured port list, which is more reliable than this table for a specific deployment.
+The `signet_active_series_estimate` metric in `/metrics` is the exact number of
+series emitted by Signet's inventory collector gather. It excludes separately
+registered Go, process, and remote-write self-metrics, and reflects currently
+observed open ports and conditional metrics rather than a configured capacity
+bound.
 
-### /14+ deployments
+### Larger address spaces
 
-At /14 and larger, plan for Prometheus federation or a horizontally scalable TSDB (Thanos, Cortex, Mimir) from the start. Retrofitting remote storage after a TSDB is already straining is painful. The inflection point is not just series count but scrape cardinality — at /14+, a single Prometheus instance scraping Signet will have its query layer stressed by even simple aggregations. If a /14+ deployment is in scope, this should already be an infrastructure architecture discussion, not a surprise. Signet is designed to be a good federation citizen: all metrics carry `subnet` labels suitable for hierarchical aggregation.
+Each configured discovery declaration is limited to `/16` or smaller. To cover a
+larger address space, partition it into distinct, non-overlapping supported
+subnets; overlapping declarations are rejected. Size Prometheus or remote
+storage for the aggregate series count across those independent `/16`-or-smaller
+declarations. Signet labels inventory metrics by subnet, so this partitioning
+also provides a natural aggregation boundary.
 
 ### PromQL join examples for `signet_host_info`
 
@@ -505,23 +510,23 @@ signet_unauthorized_device_detected * on(ip, subnet) group_left(vendor, mac)
 
 # Count live hosts by vendor
 count by (vendor) (
-  signet_host_up * on(ip, subnet) group_left(vendor) signet_host_info
+  (signet_host_up == 1) * on(ip, subnet) group_left(vendor) signet_host_info
 )
 
 # Alert on hosts with hostname matching a pattern that are down
-signet_host_up == 0
+(signet_host_up == 0)
   * on(ip, subnet) group_left(hostname)
   signet_host_info{hostname=~"prod-.*"}
 ```
 
 ### TTL tuning guidance
 
-The default TTL of 3× the scan interval means a host must miss three consecutive scans before being pruned. For most environments this is appropriate — it tolerates transient scan failures (packet loss, host briefly unavailable) without generating false `HostExpired` audit events. In environments with very long scan intervals (>30 minutes), consider setting an explicit `host_ttl` in `signet.yaml` to avoid retaining stale data for hours. In environments where any host disappearance is immediately significant (air-gapped networks with a fixed inventory), tighten the TTL to 1× or 2× the scan interval and treat `HostExpired` audit events as actionable.
+When `host_ttl` is omitted, the default is 3× the longest configured subnet scan interval. This prevents hosts on a slower subnet from expiring during normal scheduling; on deployments with different per-subnet intervals, hosts on faster subnets may therefore survive more than three missed scans. For most environments this tolerates transient scan failures without generating false `HostExpired` audit events. Set an explicit global TTL when tighter expiry is required.
 
 ```yaml
 # Explicit TTL: 15 minutes regardless of scan interval
 host_ttl: 15m
 
-# Disable TTL eviction entirely (hosts persist until restart)
+# Disable TTL eviction entirely (including for the persistent backend)
 host_ttl: 0
 ```

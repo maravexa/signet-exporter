@@ -34,7 +34,8 @@ type Client struct {
 	httpClient  *http.Client
 	endpoint    string
 	auth        AuthConfig
-	bearerToken atomic.Pointer[string] // hot-reloadable; nil for non-bearer auth
+	bearerToken atomic.Pointer[string] // set once at construction; nil for non-bearer auth
+	basicSecret atomic.Pointer[string] // set once at construction; nil for non-basic auth
 	userAgent   string
 }
 
@@ -68,11 +69,12 @@ func IsRecoverable(err error) bool {
 
 // NewClient builds a Client whose transport encodes the configured auth
 // mode. mTLS sets RootCAs and the client keypair on the TLS config; bearer
-// pre-loads the token from disk into an atomic pointer for hot-reload.
+// and basic credentials are read before the Client is published to a Sender.
 //
-// Failure to read TLS material or the bearer token at startup is fatal —
-// callers should treat it as "refuse to start". Failure to read on a
-// later ReloadAuth retains the previous credentials.
+// Failure to read TLS material or a configured credential at startup is fatal
+// — callers should treat it as "refuse to start". Sender.Reload builds a new
+// client before replacing the old one, so a later failed rotation is retained
+// safely by the old client.
 func NewClient(cfg Config, version string) (*Client, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS12}
 
@@ -86,6 +88,9 @@ func NewClient(cfg Config, version string) (*Client, error) {
 		cert, err := tls.LoadX509KeyPair(cfg.Auth.ClientCertFile, cfg.Auth.ClientKeyFile)
 		if err != nil {
 			return nil, fmt.Errorf("load client keypair: %w", err)
+		}
+		if err := validateClientCertificate(cert, time.Now()); err != nil {
+			return nil, err
 		}
 		tlsCfg.Certificates = []tls.Certificate{cert}
 	}
@@ -113,25 +118,37 @@ func NewClient(cfg Config, version string) (*Client, error) {
 		}
 		c.bearerToken.Store(&token)
 	}
+	if cfg.Auth.Type == "basic" {
+		password, err := readTrimmed(cfg.Auth.BasicPasswordFile)
+		if err != nil {
+			return nil, fmt.Errorf("read basic auth password: %w", err)
+		}
+		c.basicSecret.Store(&password)
+	}
 	return c, nil
 }
 
-// ReloadAuth re-reads token / cert files. On read failure the previous
-// credentials are retained — operators should expect a warning log rather
-// than a service interruption.
-func (c *Client) ReloadAuth(cfg AuthConfig) error {
-	c.auth = cfg
-	if cfg.Type == "bearer" {
-		token, err := readTrimmed(cfg.BearerTokenFile)
-		if err != nil {
-			return fmt.Errorf("read bearer token: %w", err)
-		}
-		c.bearerToken.Store(&token)
+// validateClientCertificate rejects a locally unusable client certificate at
+// construction/reload time. This mirrors the listener keypair reloader and
+// preserves the previously published immutable client on a bad rotation.
+func validateClientCertificate(cert tls.Certificate, now time.Time) error {
+	if len(cert.Certificate) == 0 {
+		return fmt.Errorf("client certificate has no leaf")
 	}
-	// mTLS reload requires rebuilding the transport; the Sender owns that
-	// path because it must coordinate with in-flight requests via context
-	// cancellation. Bearer/basic reload is a hot-path fast case so we keep
-	// it here and let Sender call NewClient for full TLS rebuild.
+	leaf := cert.Leaf
+	if leaf == nil {
+		parsed, err := x509.ParseCertificate(cert.Certificate[0])
+		if err != nil {
+			return fmt.Errorf("parse client certificate leaf: %w", err)
+		}
+		leaf = parsed
+	}
+	if now.Before(leaf.NotBefore) {
+		return fmt.Errorf("client certificate is not valid before %s", leaf.NotBefore.UTC().Format(time.RFC3339))
+	}
+	if !now.Before(leaf.NotAfter) {
+		return fmt.Errorf("client certificate expired at %s", leaf.NotAfter.UTC().Format(time.RFC3339))
+	}
 	return nil
 }
 
@@ -160,11 +177,11 @@ func (c *Client) Send(ctx context.Context, req *prompb.WriteRequest) error {
 			httpReq.Header.Set("Authorization", "Bearer "+*tok)
 		}
 	case "basic":
-		password, perr := readTrimmed(c.auth.BasicPasswordFile)
-		if perr != nil {
-			return &SendError{StatusCode: 0, Message: "basic auth password unreadable: " + perr.Error(), Recoverable: false}
+		if password := c.basicSecret.Load(); password != nil {
+			httpReq.SetBasicAuth(c.auth.BasicUsername, *password)
+		} else {
+			return &SendError{StatusCode: 0, Message: "basic auth password unavailable", Recoverable: false}
 		}
-		httpReq.SetBasicAuth(c.auth.BasicUsername, password)
 	}
 
 	resp, err := c.httpClient.Do(httpReq)

@@ -140,3 +140,46 @@ func TestQueue_ConcurrentPushPop(t *testing.T) {
 
 	wg.Wait()
 }
+
+func TestQueue_SetCapacityDropsOldest(t *testing.T) {
+	q := NewQueue(10)
+	for _, value := range []float64{1, 2, 3} {
+		q.Push(&prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+			Samples: []prompb.Sample{{Value: value}},
+		}}})
+	}
+
+	if dropped := q.SetCapacity(2); dropped != 1 {
+		t.Fatalf("SetCapacity dropped = %d, want 1", dropped)
+	}
+	if got := q.Capacity(); got != 2 {
+		t.Fatalf("Capacity = %d, want 2", got)
+	}
+	for _, want := range []float64{2, 3} {
+		req, ok := q.PopWithContext(context.Background())
+		if !ok {
+			t.Fatal("PopWithContext unexpectedly failed")
+		}
+		if got := req.Timeseries[0].Samples[0].Value; got != want {
+			t.Errorf("remaining payload value = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestQueue_CoalescesConsecutiveEmptySnapshots(t *testing.T) {
+	q := NewQueue(10)
+	q.PushWithGeneration(&prompb.WriteRequest{}, 7)
+	q.PushWithGeneration(&prompb.WriteRequest{}, 7)
+	q.PushWithGeneration(&prompb.WriteRequest{}, 7)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, generation, ok := q.PopWithGeneration(ctx); !ok || generation != 7 {
+		t.Fatalf("first pop = generation %d, ok %v", generation, ok)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel2()
+	if _, _, ok := q.PopWithGeneration(ctx2); ok {
+		t.Fatal("consecutive empty snapshots were not coalesced")
+	}
+}

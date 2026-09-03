@@ -19,7 +19,7 @@ build:
 	@mkdir -p $(DIST)
 	go build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/$(BINARY) $(CMD)
 
-## build-fips: compile with FIPS 140-2 compliant BoringCrypto
+## build-fips: compile the BoringCrypto variant (not a certification claim)
 build-fips:
 	@mkdir -p $(DIST)
 	GOEXPERIMENT=boringcrypto go build -trimpath -ldflags "$(LDFLAGS)" \

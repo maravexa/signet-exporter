@@ -14,6 +14,9 @@ listen_address: "127.0.0.1:9420"
 # TLS configuration for the /metrics endpoint.
 # Leave cert_file and key_file empty to run without TLS (not recommended in production).
 # Uncomment TLS section to enable TLS (strongly RECOMMENDED in production).
+# Private keys and remote-write credential files must be regular, non-symlink
+# files with no permissions for "other" users (for example 0640); group access
+# for signet is allowed.
 # Run: signet-exporter --generate-certs /etc/signet/tls  to create a dev cert chain.
 #tls:
   #cert_file: "/etc/signet/tls/server.pem"
@@ -36,9 +39,10 @@ subnets:
     scan_interval: 60s
     # TCP ports to probe on each discovered host.
     ports: [22, 80, 443, 3389, 8080, 8443]
-    # Path to a newline-delimited file of authorized MAC addresses (one per line,
+    # Path to a newline-delimited inventory/compliance MAC allowlist (one per line,
     # colon-separated, e.g. "aa:bb:cc:dd:ee:ff"). Devices not in this list will
-    # trigger signet_unauthorized_device_detected = 1.
+    # trigger signet_unauthorized_device_detected = 1. This classifies inventory
+    # only; it does not authenticate a device or control network access.
     #mac_allowlist_file: "/etc/signet/allowlists/10.0.1.allowlist"
 
   - cidr: "10.0.2.0/24"
@@ -93,7 +97,9 @@ audit:
   #   "stdout"  — standard output
   #   "file"    — append to the file at path (see below)
   output: "file"
-  # File path, used when output is "file". Parent directory must exist.
+  # File path, used when output is "file". Parent directory must exist; an
+  # existing target must be a regular non-symlink file and inaccessible to
+  # "other" users.
   path: "/var/log/signet/audit.log"
 
 # -----------------------------------------------------------------------------
@@ -111,8 +117,9 @@ audit:
 # -----------------------------------------------------------------------------
 remote_write:
   enabled: false
-  # Receiver URL. Scheme must be http or https. Single endpoint per Signet
-  # instance — multi-endpoint fan-out is deferred to v0.7.0.
+  # Receiver URL. mTLS, bearer, and basic authentication require https. Plain
+  # http is allowed only with auth.type "none" and emits a startup warning.
+  # Single endpoint per Signet instance — multi-endpoint fan-out is deferred.
   endpoint: "https://mimir.example.internal/api/v1/push"
   # How often to gather metrics and enqueue a push batch.
   interval: 60s
@@ -144,7 +151,7 @@ remote_write:
     # The file is re-read on SIGHUP so token rotation does not require restart.
     #bearer_token_file: "/etc/signet/grafana-cloud-token"
 
-    # HTTP basic authentication.
+    # HTTP basic authentication. The password file is re-read on SIGHUP.
     # Uncomment, set type: "basic", and supply username + password file.
     #basic_username: "signet"
     #basic_password_file: "/etc/signet/remote-write-password"

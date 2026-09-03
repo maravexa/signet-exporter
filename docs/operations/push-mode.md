@@ -14,9 +14,9 @@ If you are running Alloy, scrape Signet with Alloy. Use Signet's native remote w
 
 ## 2. Cardinality at the receiver
 
-Push mode amplifies the cost of cardinality decisions. In scrape mode, a high-cardinality metric creates load on the Prometheus TSDB but the series are bounded by what Prometheus can ingest in a given scrape. In push mode, every label combination becomes a series at the receiver, and those series persist until the receiver's retention sweeps them. A single Signet scrape that emits 5,000 series produces 5,000 receiver-side series; if hostname churn (DHCP reassignment) creates new label combinations at every scrape interval, those stale series accumulate at the receiver long after the host has gone — until retention expires them.
+Push mode amplifies the cost of cardinality decisions. In scrape mode, a high-cardinality metric creates load on the Prometheus TSDB but the series are bounded by what Prometheus can ingest in a given scrape. In push mode, every label combination becomes a series at the receiver. When a clean later gather no longer includes a previously sent series, Signet writes the Prometheus stale-marker sample for that label set; receivers must support Prometheus remote-write staleness semantics. Label churn can still create many historical series before they become stale.
 
-**The Phase 5 cardinality work is the foundation that makes push mode safe at scale.** The `signet_host_up` / `signet_host_info` split moved high-churn labels (`hostname`, `vendor`, `mac`) off the hot-path health metric and onto a separate info metric. The `signet_active_series_estimate` gauge provides a real-time pre-ingestion cardinality estimate based on actual host count and configured port list. These two design decisions mean operators have the tools they need to understand and control receiver-side series volume before it becomes a problem.
+**The host/info split is the foundation that makes push mode manageable at scale.** The `signet_host_up` / `signet_host_info` split moved high-churn labels (`hostname`, `vendor`, `mac`) off the hot-path health metric and onto a separate info metric. `signet_active_series_estimate` reports the exact number of series from Signet's inventory collector gather, including only currently observed open ports and conditional metrics; it excludes separately registered Go, process, and remote-write self-metrics.
 
 **DHCP hostname churn is the primary receiver-side risk.** In environments where hosts acquire hostnames via DHCP, each new hostname value creates a new `signet_host_info` series at the receiver. The old series becomes stale and is not cleaned up until retention expires it. The v0.5.0 info-split addressed this specifically: by moving `hostname` to `signet_host_info`, operators can scrape the enrichment metric less frequently or drop it entirely at the receiver. The `cardinality-conscious.alloy` example demonstrates both patterns. The same patterns apply when using native remote write — at the Signet config level rather than the Alloy relabel level.
 
@@ -34,7 +34,7 @@ count(count by (hostname) (signet_host_info))
 
 For receiver-specific cardinality tooling: Mimir exposes a `cardinality_analysis` API at `/api/v1/cardinality/label_names` and `/api/v1/cardinality/label_values`; Prometheus exposes raw label enumeration at `/api/v1/labels` and `/api/v1/label/{label_name}/values`. Both can be used to identify which label dimensions are growing fastest.
 
-**`signet_active_series_estimate`** is the authoritative pre-receiver-side cardinality predictor. Query it from Signet's `/metrics` endpoint to understand what the exporter is about to push before the receiver sees it. It accounts for actual observed host count and the configured port list, making it more accurate than static calculations.
+**`signet_active_series_estimate`** is the authoritative inventory-collector current-gather cardinality count. Query it from Signet's `/metrics` endpoint to understand its inventory contribution before separately registered runtime and remote-write self-metrics. It does not predict future port observations or label churn.
 
 ---
 
@@ -73,33 +73,57 @@ remote_write:
 
 ---
 
-## 4. FIPS compliance for the remote write path
+## 4. BoringCrypto build verification for the remote write path
 
-Operators in regulated environments need to verify that enabling remote write does not break their FIPS posture. The answer is that it does not, and the reasoning is verifiable.
+Operators in regulated environments must assess the complete deployment,
+including the Go toolchain, operating environment, receiver, and certificate
+handling. Signet CI verifies that its optional BoringCrypto build contains the
+expected symbols and reports the runtime flag; that is not a product-level
+certification claim.
 
 **Snappy compression is not a cryptographic primitive.** The remote write protocol uses Snappy to compress the protobuf payload before transmission. Snappy provides data compression only — it has no security properties, makes no confidentiality guarantees, and is not subject to FIPS 140-2 or FIPS 140-3 cryptographic algorithm requirements. Its presence in the remote write path is FIPS-irrelevant. Compliance reviewers should treat it the same as gzip or zstd: a transport encoding, not a cryptographic operation.
 
-**TLS for the remote write client uses Go's stdlib `crypto/tls`.** The remote write client opens an HTTPS connection to the configured endpoint using the same TLS stack as Signet's `/metrics` listener. When Signet is built with `GOEXPERIMENT=boringcrypto`, the stdlib's cryptographic operations — key generation, cipher suite negotiation, certificate chain validation, RNG sourcing — all go through the BoringCrypto FIPS module. The remote write client inherits this automatically because it uses the same stdlib; there is no separate crypto path to audit.
+**TLS for the remote write client uses Go's stdlib `crypto/tls`.** The remote
+write client and `/metrics` listener use the same Go TLS implementation. A
+`GOEXPERIMENT=boringcrypto` build therefore applies the selected toolchain
+mode to both paths; validate the resulting binary and receiver configuration
+in your deployment.
 
-**`signet_exporter_fips_enabled` is the authoritative runtime indicator.** This metric (introduced in v0.4.0) reports `1` when the binary was built with BoringCrypto active. A value of `1` means all cryptographic operations in the binary — including the remote write TLS client — are going through the FIPS-validated module. Query it from `/metrics`:
+**`signet_exporter_fips_enabled` is the runtime build indicator.** It reports
+`1` when the binary was built with BoringCrypto active. It indicates the build
+mode, not deployment certification. Query it from `/metrics`:
 
 ```
 signet_exporter_fips_enabled 1
 ```
 
-**Verifying end-to-end FIPS coverage:**
+**Verifying the Signet build mode:**
 
 1. Build with `GOEXPERIMENT=boringcrypto`: `make build-fips`
 2. Confirm `signet_exporter_fips_enabled == 1` in `/metrics`
 3. Enable remote write and configure an mTLS endpoint
 4. Capture a TLS handshake with `tcpdump -i any -w /tmp/rw-handshake.pcap host <receiver-ip> and port <receiver-port>`
-5. Decode in Wireshark and verify the negotiated cipher suite is in the FIPS-approved set (AES-128-GCM-SHA256, AES-256-GCM-SHA384, or equivalent approved suites). Alternatively, check the receiver's TLS handshake logs if the receiver records them.
+5. Inspect the receiver's TLS handshake logs and apply your organization's
+   approved-cipher and certificate policy.
 
-**mTLS auth is the recommended choice in FIPS environments.** Bearer tokens stored at rest in files (`auth.bearer_token_file`) are outside the scope of FIPS validation — they are pre-shared secrets managed by operator procedure, not cryptographic keys. mTLS client certificates are issued by the same PKI infrastructure as Signet's server certs, meaning their lifecycle (issuance, rotation, revocation) follows the same process as the rest of Signet's TLS posture and sits within the FIPS-validated crypto path. For compliance reviews where the auditor asks "how are authentication credentials protected?", mTLS has a cleaner answer than bearer tokens.
+**mTLS is the recommended remote-write authentication mode** when an
+organization's PKI and receiver support it. Bearer and basic credentials are
+also supported only over HTTPS and must follow the documented file-permission
+policy.
 
 ---
 
 ## 5. mTLS configuration for remote write
+
+Remote-write mTLS, bearer-token, and HTTP basic authentication require an
+`https://` endpoint. Signet rejects those credential-bearing modes over
+plaintext HTTP so a configuration cannot silently expose credentials or leave
+mTLS unused. `auth.type: none` is the explicit unauthenticated exception and
+emits a warning; use it only on a protected network.
+
+TLS and credential inputs must be regular, non-symlink files. Private keys,
+bearer tokens, and basic-auth password files may be group-readable for the
+service group but must not be readable or writable by "other" users.
 
 **Reusing existing Signet certificates.** The `auth.client_cert_file` and `auth.client_key_file` configuration fields can point at the same certificates used by Signet's TLS listener — operators with a single internal CA and per-instance cert typically point both at the same files. This works when the receiver's CA bundle includes the same issuer that signed Signet's server cert. Configuration:
 
@@ -125,7 +149,7 @@ remote_write:
 
 This makes the two trust domains visually distinct in the filesystem and simplifies cert rotation — rotating the listener certs does not accidentally affect the remote write client and vice versa.
 
-**Cert rotation.** Sending `SIGHUP` to Signet (`systemctl reload signet-exporter`) causes the remote write client to re-read the cert, key, and CA files from disk. In-flight requests complete using the old TLS configuration. New connections after the reload use the new certificates. This matches Phase 4's listener cert rotation behavior and uses the same operator workflow — `systemctl reload` is the single command for both.
+**Credential and certificate rotation.** Sending `SIGHUP` to Signet (`systemctl reload signet-exporter`) causes the remote write client to build a fresh immutable client from the configured cert, key, CA, bearer-token, or basic-password files—even when the paths have not changed. If any new material cannot be read or parsed, the prior client remains active. A reload cancels an in-flight request so the next attempt uses the new client. This shares the listener certificate-rotation workflow: `systemctl reload` is the single command for both.
 
 **System root CA pool vs. explicit pinning.** The default behavior when `auth.ca_cert_file` is configured is explicit pinning: only the configured CA is trusted for the remote write endpoint. To use the system root CA pool instead (appropriate for Grafana Cloud, commercial SaaS receivers, or any receiver whose TLS cert chains to a public CA), use `auth.type: bearer` or `auth.type: basic` without a `ca_cert_file` — the stdlib defaults to the system root pool when no CA file is configured. Do not set `auth.ca_cert_file` to a system bundle path; let the stdlib handle it.
 
@@ -143,4 +167,7 @@ This makes the two trust domains visually distinct in the filesystem and simplif
 
 **When to add Alloy in front.** If a single Signet instance must fan out to multiple backends simultaneously — for example, a primary Mimir for operational alerting and a secondary cold-storage receiver for compliance archival — Alloy is the right tool. Signet's native remote write is single-endpoint by design; multi-endpoint fan-out is deferred to v0.7.0. Alloy's `prometheus.remote_write` component supports multiple endpoints natively and handles the fan-out, retries, and queue management per-backend.
 
-**Federation pattern for very large deployments.** Deployments covering /14 or larger subnet aggregates should follow the standard Prometheus federation or Thanos/Cortex receive patterns. At that scale, the infrastructure architecture conversation should already be happening. Signet's role at /14+ is to be a well-behaved remote-write source within the existing pattern: all metrics carry `subnet` labels suitable for hierarchical aggregation, and `signet_active_series_estimate` gives each instance's contribution to the total series budget.
+**Larger address spaces.** A single discovery declaration cannot be broader than
+`/16`. Partition larger spaces into non-overlapping `/16`-or-smaller
+declarations, then budget aggregate collector series and receiver capacity
+across those partitions. Overlapping declarations are rejected.

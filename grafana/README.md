@@ -1,6 +1,9 @@
 # Grafana Dashboard — Signet Exporter
 
-Pre-built Grafana dashboard for Signet Exporter metrics.
+`signet-overview.json` is a placeholder and is not currently an importable
+Grafana dashboard. This document is retained as a design checklist for a
+future dashboard; use the metric reference and PromQL examples in the project
+README to create panels for now.
 
 ## Prerequisites
 

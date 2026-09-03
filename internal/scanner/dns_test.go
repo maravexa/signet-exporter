@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -194,8 +195,8 @@ func TestDNSScan_ForwardReverseMismatch(t *testing.T) {
 	}
 }
 
-// TestDNSScan_NoPTRRecord verifies that hosts with no PTR record produce no
-// result and no error (missing PTR is normal).
+// TestDNSScan_NoPTRRecord verifies that a successful negative PTR lookup emits
+// an explicit empty result, allowing source-owned state to clear stale DNS data.
 func TestDNSScan_NoPTRRecord(t *testing.T) {
 	store := state.NewMemoryStore()
 	insertHost(t, store, "10.0.1.1", "aa:bb:cc:dd:ee:01")
@@ -210,14 +211,55 @@ func TestDNSScan_NoPTRRecord(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan returned unexpected error: %v", err)
 	}
-	if len(results) != 0 {
-		t.Errorf("expected 0 results for host with no PTR, got %d", len(results))
+	if len(results) != 1 {
+		t.Fatalf("expected one explicit empty result for host with no PTR, got %d", len(results))
+	}
+	if results[0].Hostnames == nil || results[0].DNSMismatches == nil {
+		t.Errorf("successful empty DNS result must carry non-nil owned fields: %+v", results[0])
+	}
+	if len(results[0].Hostnames) != 0 || len(results[0].DNSMismatches) != 0 {
+		t.Errorf("expected empty DNS fields, got hostnames=%v mismatches=%v", results[0].Hostnames, results[0].DNSMismatches)
+	}
+}
+
+func TestDNSScan_PreservesDiscoveryLiveness(t *testing.T) {
+	store := state.NewMemoryStore()
+	oldSeen := time.Now().Add(-time.Hour).Round(0)
+	mac, err := net.ParseMAC("aa:bb:cc:dd:ee:01")
+	if err != nil {
+		t.Fatal(err)
+	}
+	host := state.HostRecord{
+		IP:       netip.MustParseAddr("10.0.1.1"),
+		MAC:      mac,
+		LastSeen: oldSeen,
+		Alive:    false,
+	}
+	if _, err := store.UpdateHost(context.Background(), host); err != nil {
+		t.Fatal(err)
+	}
+	scanner := newDNSWithMock(store, &mockDNSLookup{
+		ptrRecords: map[string][]string{"10.0.1.1": {"server.example.com."}},
+		aRecords:   map[string][]string{"server.example.com": {"10.0.1.1"}},
+	})
+	results, err := scanner.Scan(context.Background(), netip.MustParsePrefix("10.0.1.0/24"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	if results[0].Alive {
+		t.Errorf("DNS result changed discovery liveness: Alive=%t", results[0].Alive)
+	}
+	if !results[0].Timestamp.After(oldSeen) {
+		t.Errorf("DNS observation timestamp %s was not refreshed after %s", results[0].Timestamp, oldSeen)
 	}
 }
 
 // TestDNSScan_ForwardLookupFails verifies that a hostname whose forward lookup
 // fails is treated as a mismatch (cannot verify = mismatch).
-func TestDNSScan_ForwardLookupFails(t *testing.T) {
+func TestDNSScan_ForwardLookupFailurePreservesPriorObservation(t *testing.T) {
 	store := state.NewMemoryStore()
 	insertHost(t, store, "10.0.1.1", "aa:bb:cc:dd:ee:01")
 
@@ -235,12 +277,25 @@ func TestDNSScan_ForwardLookupFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Scan error: %v", err)
 	}
-	if len(results) != 1 {
-		t.Fatalf("expected 1 result, got %d", len(results))
+	if len(results) != 0 {
+		t.Fatalf("forward lookup transport failure returned %d updates; want preservation", len(results))
 	}
-	if !containsString(results[0].DNSMismatches, "server1.example.com") {
-		t.Errorf("DNSMismatches = %v, want to contain %q (forward fail = mismatch)",
-			results[0].DNSMismatches, "server1.example.com")
+}
+
+func TestDNSScan_ForwardTransportFailurePreservesPriorObservation(t *testing.T) {
+	store := state.NewMemoryStore()
+	insertHost(t, store, "10.0.1.1", "aa:bb:cc:dd:ee:01")
+
+	scanner := newDNSWithMock(store, &mockDNSLookup{
+		ptrRecords: map[string][]string{"10.0.1.1": {"server1.example.com."}},
+		failHosts:  map[string]error{"server1.example.com": errors.New("resolver timeout")},
+	})
+	results, err := scanner.Scan(context.Background(), netip.MustParsePrefix("10.0.1.0/24"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 0 {
+		t.Fatalf("forward transport failure returned DNS update %v; want preservation", results)
 	}
 }
 
@@ -279,6 +334,40 @@ func TestDNSScan_MultipleHostnames(t *testing.T) {
 	}
 	if !containsString(r.DNSMismatches, "server1.example.com") {
 		t.Errorf("server1.example.com should be in DNSMismatches (it mismatches)")
+	}
+}
+
+func TestDNSScan_CapsAndSortsHostnameEvidence(t *testing.T) {
+	store := state.NewMemoryStore()
+	insertHost(t, store, "10.0.1.1", "aa:bb:cc:dd:ee:01")
+	names := make([]string, 0, maxDNSNamesPerHost+8)
+	aRecords := make(map[string][]string)
+	for i := maxDNSNamesPerHost + 7; i >= 0; i-- {
+		name := fmt.Sprintf("host-%02d.example.com", i)
+		names = append(names, name+".")
+		aRecords[name] = []string{"10.0.1.1"}
+	}
+	// Include a duplicate to verify normalized unique output.
+	names = append(names, names[0])
+	scanner := newDNSWithMock(store, &mockDNSLookup{
+		ptrRecords: map[string][]string{"10.0.1.1": names},
+		aRecords:   aRecords,
+	})
+	results, err := scanner.Scan(context.Background(), netip.MustParsePrefix("10.0.1.0/24"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	r := results[0]
+	if len(r.Hostnames) != maxDNSNamesPerHost || r.Metadata["dns_results_truncated"] != "true" {
+		t.Fatalf("hostnames=%d metadata=%v; want cap %d and truncation", len(r.Hostnames), r.Metadata, maxDNSNamesPerHost)
+	}
+	for i := 1; i < len(r.Hostnames); i++ {
+		if r.Hostnames[i-1] > r.Hostnames[i] {
+			t.Fatalf("hostnames not sorted: %v", r.Hostnames)
+		}
 	}
 }
 
@@ -336,8 +425,8 @@ func TestDNSScan_EmptyStore(t *testing.T) {
 	}
 }
 
-// TestDNSScan_ContextCancellation verifies that Scan respects context cancellation
-// and returns partial results with a context error.
+// TestDNSScan_ContextCancellation verifies that cancellation is not represented
+// as a successful partial enrichment scan.
 func TestDNSScan_ContextCancellation(t *testing.T) {
 	store := state.NewMemoryStore()
 	// Insert 20 hosts, all with PTR records.
@@ -367,11 +456,7 @@ func TestDNSScan_ContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("expected context.Canceled, got %v", err)
 	}
-	// Should have partial results (at least 1, fewer than 20).
-	if len(results) == 0 {
-		t.Error("expected at least 1 partial result before cancellation")
-	}
-	if len(results) >= 20 {
-		t.Errorf("expected fewer than 20 results after cancellation, got %d", len(results))
+	if results != nil {
+		t.Errorf("cancelled scan returned partial results %v; want nil", results)
 	}
 }

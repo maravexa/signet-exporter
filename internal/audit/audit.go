@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"sync"
 	"time"
 )
 
@@ -62,6 +63,42 @@ type auditBackend interface {
 type Logger struct {
 	backend auditBackend
 	closeFn func() error // non-nil only when we opened a file
+	writer  *serializedWriter
+}
+
+// serializedWriter keeps each audit event as one visible record. File-backed
+// logs are synced after every event so a successful state transition's audit
+// record is durable before the caller moves on to the next event.
+type serializedWriter struct {
+	mu         sync.Mutex
+	w          io.Writer
+	syncer     interface{ Sync() error }
+	reportOnce sync.Once
+}
+
+func (w *serializedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	n, err := w.w.Write(p)
+	if err == nil && n == len(p) && w.syncer != nil {
+		err = w.syncer.Sync()
+	}
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	w.mu.Unlock()
+	if err != nil {
+		w.reportFailure(err)
+	}
+	return n, err
+}
+
+// reportFailure deliberately bypasses Logger/audit backends: otherwise a
+// failed audit sink would recursively attempt to audit its own failure. It is
+// rate-limited to one direct stderr diagnostic per logger lifetime.
+func (w *serializedWriter) reportFailure(err error) {
+	w.reportOnce.Do(func() {
+		_, _ = fmt.Fprintf(os.Stderr, "signet-exporter: audit write or sync failed: %v\n", err)
+	})
 }
 
 // Config holds audit logger configuration.
@@ -93,15 +130,25 @@ func NewLogger(cfg Config) (*Logger, error) {
 		return nil, err
 	}
 
+	lockedWriter := &serializedWriter{w: w}
+	if cfg.Output != "" && cfg.Output != "stderr" && cfg.Output != "stdout" {
+		// Only regular audit files need a durability barrier. Syncing an
+		// inherited stdout/stderr descriptor can fail or be meaningless.
+		syncer, ok := w.(interface{ Sync() error })
+		if ok {
+			lockedWriter.syncer = syncer
+		}
+	}
+
 	var backend auditBackend
 	switch cfg.Format {
 	case "cef":
-		backend = NewCEFFormatter(w, cfg.Version)
+		backend = NewCEFFormatter(lockedWriter, cfg.Version)
 	default: // "json" or ""
-		backend = newJSONBackend(w)
+		backend = newJSONBackend(lockedWriter)
 	}
 
-	return &Logger{backend: backend, closeFn: closeFn}, nil
+	return &Logger{backend: backend, closeFn: closeFn, writer: lockedWriter}, nil
 }
 
 func openWriter(cfg Config) (io.Writer, func() error, error) {
@@ -115,19 +162,36 @@ func openWriter(cfg Config) (io.Writer, func() error, error) {
 		if path == "" {
 			path = "/var/log/signet/audit.log"
 		}
-		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+		f, err := openAuditFile(path)
 		if err != nil {
 			return nil, nil, fmt.Errorf("audit: open %q: %w", path, err)
 		}
 		return f, f.Close, nil
 	default:
 		// Backward compatibility: treat Output as a direct file path.
-		f, err := os.OpenFile(cfg.Output, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+		f, err := openAuditFile(cfg.Output)
 		if err != nil {
 			return nil, nil, fmt.Errorf("audit: open %q: %w", cfg.Output, err)
 		}
 		return f, f.Close, nil
 	}
+}
+
+func openAuditFile(path string) (*os.File, error) {
+	if info, err := os.Lstat(path); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("existing audit target must not be a symlink")
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("existing audit target must be a regular file")
+		}
+		if info.Mode().Perm()&0o007 != 0 {
+			return nil, fmt.Errorf("existing audit target must not be accessible by other users")
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
 }
 
 // Disabled returns a no-op logger. All methods are safe to call and emit nothing.
@@ -137,15 +201,30 @@ func Disabled() *Logger {
 
 // newLoggerFromWriter creates a JSON logger writing to w. Used by tests.
 func newLoggerFromWriter(w io.Writer) *Logger {
-	return &Logger{backend: newJSONBackend(w)}
+	lockedWriter := &serializedWriter{w: w}
+	return &Logger{backend: newJSONBackend(lockedWriter), writer: lockedWriter}
 }
 
 // Close closes the underlying file if one was opened. No-op for stderr, stdout, or discard.
 func (l *Logger) Close() error {
-	if l.closeFn != nil {
-		return l.closeFn()
+	if l.closeFn == nil {
+		return nil
 	}
-	return nil
+	// Use the same mutex as writes so a shutdown cannot close a file beneath
+	// an in-progress CEF or JSON record.
+	l.writer.mu.Lock()
+	defer l.writer.mu.Unlock()
+	if l.writer.syncer != nil {
+		if err := l.writer.syncer.Sync(); err != nil {
+			l.writer.reportFailure(err)
+			return err
+		}
+	}
+	err := l.closeFn()
+	if err != nil {
+		l.writer.reportFailure(err)
+	}
+	return err
 }
 
 // ---- Event methods (delegated to backend) ----------------------------------

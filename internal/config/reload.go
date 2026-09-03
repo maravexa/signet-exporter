@@ -25,7 +25,10 @@ type ReloadableSubnet struct {
 //   - state.* (backend switch requires store migration)
 type ReloadableConfig struct {
 	Subnets []ReloadableSubnet
-	HostTTL time.Duration // 0 = use 3× minimum scan interval default
+	HostTTL time.Duration
+	// HostTTLSet preserves the distinction between an omitted host_ttl and an
+	// explicit host_ttl: 0 during a live reload.
+	HostTTLSet bool
 }
 
 // ExtractReloadable extracts the mutable portion from a full Config.
@@ -43,7 +46,7 @@ func ExtractReloadable(cfg *Config) ReloadableConfig {
 			MACAllowlistFile: s.MACAllowlistFile,
 		}
 	}
-	return ReloadableConfig{Subnets: subnets, HostTTL: cfg.HostTTL}
+	return ReloadableConfig{Subnets: subnets, HostTTL: cfg.HostTTL, HostTTLSet: cfg.HostTTLSet}
 }
 
 // ValidateReloadable checks the mutable config subset for logical errors.
@@ -51,22 +54,42 @@ func ExtractReloadable(cfg *Config) ReloadableConfig {
 // Validation runs BEFORE applying the new config. If validation fails the old
 // config stays active — partial application is never possible.
 func ValidateReloadable(rc ReloadableConfig) error {
-	seen := make(map[string]bool, len(rc.Subnets))
+	seen := make(map[netip.Prefix]bool, len(rc.Subnets))
+	prefixes := make([]netip.Prefix, 0, len(rc.Subnets))
 	for _, s := range rc.Subnets {
-		if _, err := netip.ParsePrefix(s.CIDR); err != nil {
+		prefix, err := netip.ParsePrefix(s.CIDR)
+		if err != nil {
 			return fmt.Errorf("subnet %q: invalid CIDR: %w", s.CIDR, err)
 		}
-		if seen[s.CIDR] {
+		prefix = prefix.Masked()
+		if !prefix.Addr().Is4() {
+			return fmt.Errorf("subnet %q: IPv6 discovery is not supported", s.CIDR)
+		}
+		if prefix.Bits() < minIPv4DiscoveryPrefixBits {
+			return fmt.Errorf("subnet %q is too large for discovery (minimum prefix is /%d)", s.CIDR, minIPv4DiscoveryPrefixBits)
+		}
+		if seen[prefix] {
 			return fmt.Errorf("subnet %q: duplicate CIDR", s.CIDR)
 		}
-		seen[s.CIDR] = true
+		for _, existing := range prefixes {
+			if prefixesOverlap(existing, prefix) {
+				return fmt.Errorf("subnet %q: overlaps configured subnet %q", s.CIDR, existing)
+			}
+		}
+		seen[prefix] = true
+		prefixes = append(prefixes, prefix)
 		if s.ScanInterval <= 0 {
 			return fmt.Errorf("subnet %q: scan_interval must be > 0", s.CIDR)
 		}
+		seenPorts := make(map[int]bool, len(s.Ports))
 		for _, port := range s.Ports {
 			if port < 1 || port > 65535 {
 				return fmt.Errorf("subnet %q: port %d out of range (1–65535)", s.CIDR, port)
 			}
+			if seenPorts[port] {
+				return fmt.Errorf("subnet %q: duplicate port %d", s.CIDR, port)
+			}
+			seenPorts[port] = true
 		}
 		if s.MACAllowlistFile != "" {
 			if _, err := os.Stat(s.MACAllowlistFile); err != nil {
@@ -74,7 +97,14 @@ func ValidateReloadable(rc ReloadableConfig) error {
 			}
 		}
 	}
+	if rc.HostTTL < 0 {
+		return fmt.Errorf("host_ttl must be >= 0")
+	}
 	return nil
+}
+
+func prefixesOverlap(a, b netip.Prefix) bool {
+	return a.Contains(b.Addr()) || b.Contains(a.Addr())
 }
 
 // Diff compares two ReloadableConfigs and returns a human-readable list of changes.
@@ -118,12 +148,19 @@ func Diff(old, new ReloadableConfig) []string {
 		}
 	}
 
-	if old.HostTTL != new.HostTTL {
-		changes = append(changes, fmt.Sprintf("host_ttl: %s → %s", old.HostTTL, new.HostTTL))
+	if old.HostTTL != new.HostTTL || old.HostTTLSet != new.HostTTLSet {
+		changes = append(changes, fmt.Sprintf("host_ttl: %s → %s", formatHostTTL(old), formatHostTTL(new)))
 	}
 
 	sort.Strings(changes)
 	return changes
+}
+
+func formatHostTTL(rc ReloadableConfig) string {
+	if !rc.HostTTLSet {
+		return "default"
+	}
+	return rc.HostTTL.String()
 }
 
 func intsEqual(a, b []int) bool {

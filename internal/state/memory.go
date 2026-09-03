@@ -1,7 +1,6 @@
 package state
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -23,7 +22,8 @@ type MemoryStore struct {
 // MemoryStoreOption is a functional option for MemoryStore.
 type MemoryStoreOption func(*MemoryStore)
 
-// WithMaxChanges sets the ring buffer capacity for MAC-IP change events.
+// WithMaxChanges sets the finite ring-buffer capacity for MAC-IP change events.
+// Non-positive values fall back to DefaultMaxChanges.
 func WithMaxChanges(n int) MemoryStoreOption {
 	return func(m *MemoryStore) {
 		m.maxChanges = n
@@ -36,11 +36,14 @@ func NewMemoryStore(opts ...MemoryStoreOption) *MemoryStore {
 		hosts:      make(map[netip.Addr]*HostRecord),
 		macIndex:   make(map[string][]netip.Addr),
 		changes:    make([]MACIPChange, 0),
-		maxChanges: 10000,
+		maxChanges: DefaultMaxChanges,
 		scanMeta:   make(map[string]ScanMeta),
 	}
 	for _, opt := range opts {
 		opt(m)
+	}
+	if m.maxChanges <= 0 {
+		m.maxChanges = DefaultMaxChanges
 	}
 	return m
 }
@@ -98,134 +101,59 @@ func copyMACIPChange(c MACIPChange) MACIPChange {
 // UpdateHost inserts or updates a host record and reports what changed.
 // If record.MAC is nil or empty (e.g. from an ICMP scan that has no L2 info),
 // the method updates liveness fields but preserves any existing MAC binding.
-func (m *MemoryStore) UpdateHost(_ context.Context, record HostRecord) (HostChange, error) {
+func (m *MemoryStore) UpdateHost(ctx context.Context, record HostRecord) (HostChange, error) {
+	if err := contextErr(ctx); err != nil {
+		return HostChange{}, err
+	}
+	if !validObservationSource(record.Source) {
+		return HostChange{}, fmt.Errorf("unknown observation source %q", record.Source)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	existing, ok := m.hosts[record.IP]
 	if !ok {
-		// New host
-		r := copyHostRecord(&record)
-		if r.FirstSeen.IsZero() {
-			r.FirstSeen = r.LastSeen
+		if !sourceCanCreateHost(record.Source) {
+			// Enrichment results are derived from a prior state snapshot. They must
+			// not recreate a host that TTL eviction (or another writer) removed.
+			return HostChange{}, nil
 		}
+		r := newObservedHost(record)
 		m.hosts[record.IP] = &r
-		// Only index by MAC when one is present; ICMP results have no MAC.
-		if len(record.MAC) > 0 {
-			macKey := record.MAC.String()
+		if len(r.MAC) > 0 {
+			macKey := r.MAC.String()
 			m.macIndex[macKey] = append(m.macIndex[macKey], record.IP)
 		}
 		return HostChange{
+			Applied:           true,
 			IsNew:             true,
 			DuplicateDetected: record.DuplicateChecked && len(record.DuplicateMACs) > 0,
 		}, nil
 	}
 
-	if len(record.MAC) == 0 {
-		// No MAC in incoming record (e.g. ICMP or DNS result) — update liveness
-		// and enrichment fields but preserve the existing MAC binding.
-		existing.LastSeen = record.LastSeen
-		existing.Alive = record.Alive
-		if len(record.Hostnames) > 0 {
-			existing.Hostnames = make([]string, len(record.Hostnames))
-			copy(existing.Hostnames, record.Hostnames)
+	oldMAC := append(net.HardwareAddr(nil), existing.MAC...)
+	change, macChange, applied := applyHostObservation(existing, record)
+	if !applied {
+		return change, nil
+	}
+	change.Applied = true
+	if oldMAC.String() != existing.MAC.String() {
+		if len(oldMAC) > 0 {
+			oldKey := oldMAC.String()
+			m.macIndex[oldKey] = removeAddr(m.macIndex[oldKey], record.IP)
+			if len(m.macIndex[oldKey]) == 0 {
+				delete(m.macIndex, oldKey)
+			}
 		}
-		if record.DNSMismatches != nil {
-			existing.DNSMismatches = make([]string, len(record.DNSMismatches))
-			copy(existing.DNSMismatches, record.DNSMismatches)
+		if len(existing.MAC) > 0 {
+			newKey := existing.MAC.String()
+			m.macIndex[newKey] = append(m.macIndex[newKey], record.IP)
 		}
-		if len(record.OpenPorts) > 0 {
-			existing.OpenPorts = make([]uint16, len(record.OpenPorts))
-			copy(existing.OpenPorts, record.OpenPorts)
-		}
-		return HostChange{}, nil
 	}
-
-	if bytes.Equal(existing.MAC, record.MAC) {
-		// Same MAC — update fields, preserve FirstSeen.
-		existing.LastSeen = record.LastSeen
-		// Only overwrite Hostnames if the incoming record carries them; an ARP or
-		// ICMP result with no hostname data should not clear DNS-populated names.
-		if len(record.Hostnames) > 0 {
-			existing.Hostnames = make([]string, len(record.Hostnames))
-			copy(existing.Hostnames, record.Hostnames)
-		}
-		// nil means "not checked"; empty slice means "checked, no mismatches".
-		if record.DNSMismatches != nil {
-			existing.DNSMismatches = make([]string, len(record.DNSMismatches))
-			copy(existing.DNSMismatches, record.DNSMismatches)
-		}
-		if len(record.OpenPorts) > 0 {
-			existing.OpenPorts = make([]uint16, len(record.OpenPorts))
-			copy(existing.OpenPorts, record.OpenPorts)
-		}
-		existing.Vendor = record.Vendor
-		if record.AuthorizationChecked {
-			existing.AuthorizationChecked = true
-			existing.Authorized = record.Authorized
-		}
-		if record.DuplicateChecked {
-			existing.DuplicateChecked = true
-			existing.DuplicateMACs = copyDuplicateMACs(record.DuplicateMACs)
-		}
-		existing.Alive = record.Alive
-		return HostChange{DuplicateDetected: record.DuplicateChecked && len(record.DuplicateMACs) > 0}, nil
+	if macChange != nil {
+		m.appendChange(*macChange)
 	}
-
-	// Different MAC — binding change. Capture previous state before overwriting.
-	hostChange := HostChange{
-		MACChanged: true,
-		OldMAC:     make(net.HardwareAddr, len(existing.MAC)),
-		OldVendor:  existing.Vendor,
-	}
-	copy(hostChange.OldMAC, existing.MAC)
-
-	macIPChange := MACIPChange{
-		IP:        record.IP,
-		OldMAC:    make(net.HardwareAddr, len(existing.MAC)),
-		NewMAC:    make(net.HardwareAddr, len(record.MAC)),
-		Timestamp: record.LastSeen,
-	}
-	copy(macIPChange.OldMAC, existing.MAC)
-	copy(macIPChange.NewMAC, record.MAC)
-	m.appendChange(macIPChange)
-
-	// Update macIndex: remove IP from old MAC, add to new MAC
-	oldKey := existing.MAC.String()
-	newKey := record.MAC.String()
-	m.macIndex[oldKey] = removeAddr(m.macIndex[oldKey], record.IP)
-	m.macIndex[newKey] = append(m.macIndex[newKey], record.IP)
-
-	// Update the record
-	existing.MAC = make(net.HardwareAddr, len(record.MAC))
-	copy(existing.MAC, record.MAC)
-	existing.LastSeen = record.LastSeen
-	if len(record.Hostnames) > 0 {
-		existing.Hostnames = make([]string, len(record.Hostnames))
-		copy(existing.Hostnames, record.Hostnames)
-	}
-	if record.DNSMismatches != nil {
-		existing.DNSMismatches = make([]string, len(record.DNSMismatches))
-		copy(existing.DNSMismatches, record.DNSMismatches)
-	}
-	if len(record.OpenPorts) > 0 {
-		existing.OpenPorts = make([]uint16, len(record.OpenPorts))
-		copy(existing.OpenPorts, record.OpenPorts)
-	}
-	existing.Vendor = record.Vendor
-	if record.AuthorizationChecked {
-		existing.AuthorizationChecked = true
-		existing.Authorized = record.Authorized
-	}
-	if record.DuplicateChecked {
-		existing.DuplicateChecked = true
-		existing.DuplicateMACs = copyDuplicateMACs(record.DuplicateMACs)
-	}
-	existing.Alive = record.Alive
-	existing.MACChangeCount++
-	hostChange.DuplicateDetected = record.DuplicateChecked && len(record.DuplicateMACs) > 0
-
-	return hostChange, nil
+	return change, nil
 }
 
 // copyDuplicateMACs returns a deep copy of a []net.HardwareAddr slice.
@@ -265,7 +193,10 @@ func removeAddr(addrs []netip.Addr, addr netip.Addr) []netip.Addr {
 
 // GetHost retrieves a host record by IP address.
 // Returns nil, nil if the host is not found.
-func (m *MemoryStore) GetHost(_ context.Context, ip netip.Addr) (*HostRecord, error) {
+func (m *MemoryStore) GetHost(ctx context.Context, ip netip.Addr) (*HostRecord, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -280,13 +211,19 @@ func (m *MemoryStore) GetHost(_ context.Context, ip netip.Addr) (*HostRecord, er
 // ListHosts returns all host records within the given subnet prefix.
 // If subnet is the zero prefix, all hosts are returned.
 // Always returns a non-nil slice.
-func (m *MemoryStore) ListHosts(_ context.Context, subnet netip.Prefix) ([]HostRecord, error) {
+func (m *MemoryStore) ListHosts(ctx context.Context, subnet netip.Prefix) ([]HostRecord, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	result := make([]HostRecord, 0)
 	zeroPrefix := netip.Prefix{}
 	for ip, record := range m.hosts {
+		if err := contextErr(ctx); err != nil {
+			return nil, err
+		}
 		if subnet == zeroPrefix || subnet.Contains(ip) {
 			result = append(result, copyHostRecord(record))
 		}
@@ -295,7 +232,10 @@ func (m *MemoryStore) ListHosts(_ context.Context, subnet netip.Prefix) ([]HostR
 }
 
 // RecordMACChange appends a MAC-IP change event to the audit log.
-func (m *MemoryStore) RecordMACChange(_ context.Context, event MACIPChange) error {
+func (m *MemoryStore) RecordMACChange(ctx context.Context, event MACIPChange) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.appendChange(copyMACIPChange(event))
@@ -303,12 +243,18 @@ func (m *MemoryStore) RecordMACChange(_ context.Context, event MACIPChange) erro
 }
 
 // RecentChanges returns all MAC-IP change events at or after the given time.
-func (m *MemoryStore) RecentChanges(_ context.Context, since time.Time) ([]MACIPChange, error) {
+func (m *MemoryStore) RecentChanges(ctx context.Context, since time.Time) ([]MACIPChange, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	result := make([]MACIPChange, 0)
 	for _, c := range m.changes {
+		if err := contextErr(ctx); err != nil {
+			return nil, err
+		}
 		if !c.Timestamp.Before(since) {
 			result = append(result, copyMACIPChange(c))
 		}
@@ -324,7 +270,10 @@ func (m *MemoryStore) Close() error {
 // RecordScanMeta stores timing metadata for a subnet/scanner pair.
 // ErrorCount is maintained as a cumulative monotonic counter: it is preserved
 // across updates and incremented when meta.Error is true.
-func (m *MemoryStore) RecordScanMeta(_ context.Context, meta ScanMeta) error {
+func (m *MemoryStore) RecordScanMeta(ctx context.Context, meta ScanMeta) error {
+	if err := contextErr(ctx); err != nil {
+		return err
+	}
 	key := meta.Subnet.String() + "/" + meta.Scanner
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -343,13 +292,19 @@ func (m *MemoryStore) RecordScanMeta(_ context.Context, meta ScanMeta) error {
 
 // GetScanMeta returns all scan metadata entries recorded for the given subnet.
 // Returns an empty slice (not an error) if no metadata has been recorded yet.
-func (m *MemoryStore) GetScanMeta(_ context.Context, subnet netip.Prefix) ([]ScanMeta, error) {
+func (m *MemoryStore) GetScanMeta(ctx context.Context, subnet netip.Prefix) ([]ScanMeta, error) {
+	if err := contextErr(ctx); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	prefix := subnet.String() + "/"
 	result := make([]ScanMeta, 0)
 	for key, meta := range m.scanMeta {
+		if err := contextErr(ctx); err != nil {
+			return nil, err
+		}
 		if len(key) > len(prefix) && key[:len(prefix)] == prefix {
 			result = append(result, meta)
 		}
@@ -361,16 +316,31 @@ func (m *MemoryStore) GetScanMeta(_ context.Context, subnet netip.Prefix) ([]Sca
 // Returns the IPs of removed hosts. Holds the write lock for the full sweep to
 // prevent races with concurrent UpdateHost calls.
 func (m *MemoryStore) PruneStale(ttl time.Duration) ([]string, error) {
+	removedHosts, err := m.PruneStaleHosts(ttl)
+	if err != nil {
+		return nil, err
+	}
+	removed := make([]string, len(removedHosts))
+	for i, host := range removedHosts {
+		removed[i] = host.IP.String()
+	}
+	return removed, nil
+}
+
+// PruneStaleHosts removes stale hosts and returns deep copies of their state
+// immediately before deletion. The sweep and deletion occur under one write
+// lock, so returned records are suitable for accurate expiry audit events.
+func (m *MemoryStore) PruneStaleHosts(ttl time.Duration) ([]HostRecord, error) {
 	if ttl <= 0 {
 		return nil, fmt.Errorf("invalid TTL: %v", ttl)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var removed []string
+	removed := make([]HostRecord, 0)
 	for ip, host := range m.hosts {
 		if IsStale(host.LastSeen, ttl) {
-			removed = append(removed, ip.String())
+			removed = append(removed, copyHostRecord(host))
 			// Clean up macIndex for this host.
 			if len(host.MAC) > 0 {
 				macKey := host.MAC.String()

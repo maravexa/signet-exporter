@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 	"time"
 
@@ -66,14 +67,18 @@ func (a *ARPScanner) Scan(ctx context.Context, subnet netip.Prefix) ([]ScanResul
 	// safety net for early-return error paths.
 	defer func() { _ = conn.Close() }()
 
-	// Buffer the results channel at min(SubnetSize, 256) to avoid blocking the
-	// listener goroutine while we drain after the scan.
-	sz := netutil.SubnetSize(subnet)
-	bufSize := 256
-	if sz < 256 {
-		bufSize = int(sz)
-	}
-	results := make(chan ScanResult, bufSize)
+	// Keep a collector running while replies arrive. A bounded buffered channel
+	// drained only after the capture window would silently lose hosts on subnets
+	// with more replies than its capacity. Back-pressure is preferable to a
+	// false "complete" scan with missing hosts.
+	results := make(chan ScanResult)
+	var collected []ScanResult
+	var collectorWG sync.WaitGroup
+	collectorWG.Add(1)
+	go func() {
+		defer collectorWG.Done()
+		collected = collectARPResults(results)
+	}()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -116,17 +121,30 @@ sendLoop:
 	// Closing the connection unblocks the listener's ReadFrom, causing it to exit.
 	_ = conn.Close()
 	wg.Wait()
+	collectorWG.Wait()
 
-	// Collect all replies, then group by IP to detect duplicate claimants.
-	var allReplies []arpReply
+	// A cancelled scan is not a successful observation window. Do not return
+	// partial discovery data as a normal result, because callers cannot safely
+	// distinguish it from a complete sweep.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return collected, nil
+}
+
+// collectARPResults drains a reply stream until closed while grouping replies
+// incrementally. This keeps normal retransmissions and hostile reply floods
+// from accumulating an unbounded raw-reply slice.
+func collectARPResults(results <-chan ScanResult) []ScanResult {
+	acc := newARPReplyAccumulator()
 	for r := range results {
-		allReplies = append(allReplies, arpReply{
+		acc.add(arpReply{
 			IP:        r.IP,
 			MAC:       r.MAC,
 			Timestamp: r.Timestamp,
 		})
 	}
-	return groupARPReplies(allReplies), nil
+	return acc.results()
 }
 
 // arpReply holds a single parsed ARP reply for intermediate grouping.
@@ -139,51 +157,96 @@ type arpReply struct {
 // groupARPReplies groups raw ARP replies by IP, detecting when multiple distinct
 // MACs claim the same IP within a single scan window.
 //
-// The first respondent per IP becomes the primary ScanResult (existing behavior).
-// Additional distinct MACs are stored in DuplicateMACs. Retransmissions from the
-// same MAC are silently ignored. DuplicateChecked is always true on ARP results.
+// The lexicographically lowest MAC claimant per IP becomes the primary
+// ScanResult. Additional retained claimants are sorted into DuplicateMACs.
+// The bounded retained set also keeps the lowest MAC values, so packet arrival
+// order cannot change the conflict result. Retransmissions from the same MAC are
+// silently ignored. DuplicateChecked is always true on ARP results.
 func groupARPReplies(replies []arpReply) []ScanResult {
-	type ipGroup struct {
-		first    arpReply
-		dupMACs  []net.HardwareAddr
-		seenMACs map[string]bool
-	}
-
-	groups := make(map[netip.Addr]*ipGroup)
-	order := make([]netip.Addr, 0, len(replies))
-
+	acc := newARPReplyAccumulator()
 	for _, r := range replies {
-		g, ok := groups[r.IP]
-		if !ok {
-			mac := make(net.HardwareAddr, len(r.MAC))
-			copy(mac, r.MAC)
-			groups[r.IP] = &ipGroup{
-				first:    arpReply{IP: r.IP, MAC: mac, Timestamp: r.Timestamp},
-				seenMACs: map[string]bool{r.MAC.String(): true},
-			}
-			order = append(order, r.IP)
-			continue
-		}
-		macStr := r.MAC.String()
-		if !g.seenMACs[macStr] {
-			g.seenMACs[macStr] = true
-			dupMAC := make(net.HardwareAddr, len(r.MAC))
-			copy(dupMAC, r.MAC)
-			g.dupMACs = append(g.dupMACs, dupMAC)
-		}
+		acc.add(r)
 	}
+	return acc.results()
+}
 
-	out := make([]ScanResult, 0, len(groups))
-	for _, ip := range order {
-		g := groups[ip]
+type arpIPGroup struct {
+	claims    map[string]arpReply
+	truncated bool
+}
+
+type arpReplyAccumulator struct {
+	groups map[netip.Addr]*arpIPGroup
+	order  []netip.Addr
+}
+
+func newARPReplyAccumulator() *arpReplyAccumulator {
+	return &arpReplyAccumulator{groups: make(map[netip.Addr]*arpIPGroup)}
+}
+
+func (a *arpReplyAccumulator) add(r arpReply) {
+	g, ok := a.groups[r.IP]
+	if !ok {
+		a.groups[r.IP] = &arpIPGroup{
+			claims: map[string]arpReply{r.MAC.String(): {IP: r.IP, MAC: append(net.HardwareAddr(nil), r.MAC...), Timestamp: r.Timestamp}},
+		}
+		a.order = append(a.order, r.IP)
+		return
+	}
+	macStr := r.MAC.String()
+	if existing, exists := g.claims[macStr]; exists {
+		if r.Timestamp.Before(existing.Timestamp) {
+			existing.Timestamp = r.Timestamp
+			g.claims[macStr] = existing
+		}
+		return
+	}
+	// Retain the lexicographically lowest bounded claimant set, independent of
+	// packet arrival order. The smallest MAC is the deterministic primary.
+	if len(g.claims) >= maxDuplicateMACsPerIP+1 {
+		largest := ""
+		for claim := range g.claims {
+			if claim > largest {
+				largest = claim
+			}
+		}
+		if macStr >= largest {
+			g.truncated = true
+			return
+		}
+		delete(g.claims, largest)
+		g.truncated = true
+	}
+	g.claims[macStr] = arpReply{IP: r.IP, MAC: append(net.HardwareAddr(nil), r.MAC...), Timestamp: r.Timestamp}
+}
+
+func (a *arpReplyAccumulator) results() []ScanResult {
+	out := make([]ScanResult, 0, len(a.groups))
+	for _, ip := range a.order {
+		g := a.groups[ip]
+		claimKeys := make([]string, 0, len(g.claims))
+		for claim := range g.claims {
+			claimKeys = append(claimKeys, claim)
+		}
+		sort.Strings(claimKeys)
+		primary := g.claims[claimKeys[0]]
+		duplicates := make([]net.HardwareAddr, 0, len(claimKeys)-1)
+		for _, claim := range claimKeys[1:] {
+			duplicates = append(duplicates, append(net.HardwareAddr(nil), g.claims[claim].MAC...))
+		}
+		metadata := map[string]string(nil)
+		if g.truncated {
+			metadata = map[string]string{"duplicate_claimants_truncated": "true"}
+		}
 		out = append(out, ScanResult{
-			IP:               g.first.IP,
-			MAC:              g.first.MAC,
+			IP:               primary.IP,
+			MAC:              primary.MAC,
 			Alive:            true,
 			Source:           "arp",
-			Timestamp:        g.first.Timestamp,
+			Timestamp:        primary.Timestamp,
 			DuplicateChecked: true,
-			DuplicateMACs:    g.dupMACs,
+			DuplicateMACs:    duplicates,
+			Metadata:         metadata,
 		})
 	}
 	return out
@@ -214,8 +277,6 @@ func (a *ARPScanner) listenForReplies(ctx context.Context, conn net.PacketConn, 
 		case results <- result:
 		case <-ctx.Done():
 			return
-		default:
-			// Buffer full — drop duplicate reply rather than blocking.
 		}
 	}
 }

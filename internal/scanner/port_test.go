@@ -65,6 +65,13 @@ func TestCheckPort_ClosedPort(t *testing.T) {
 	}
 }
 
+func TestProbePort_RefusedIsDefinitivelyClosed(t *testing.T) {
+	p := newTestPortScanner(state.NewMemoryStore(), nil, nil)
+	if got := p.probePort(context.Background(), netip.MustParseAddr("127.0.0.1"), 59999); got != portProbeClosed {
+		t.Fatalf("refused port outcome = %v, want closed", got)
+	}
+}
+
 func TestCheckPort_Timeout(t *testing.T) {
 	p := newTestPortScanner(state.NewMemoryStore(), nil, nil)
 	// Use a very short context deadline to force a timeout.
@@ -78,6 +85,9 @@ func TestCheckPort_Timeout(t *testing.T) {
 
 	if open {
 		t.Error("expected non-routable address to return false")
+	}
+	if got := p.probePort(ctx, ip, 80); got != portProbeUnknown {
+		t.Errorf("timeout outcome = %v, want unknown", got)
 	}
 	// Should return quickly (context fires at 10ms + small epsilon), not hang for the full 500ms timeout.
 	if elapsed > 500*time.Millisecond {
@@ -167,6 +177,28 @@ func TestPortScan_NoPorts_ReturnsNil(t *testing.T) {
 	}
 }
 
+func TestPortScan_GenerationWithNoPortsClearsSnapshot(t *testing.T) {
+	store := state.NewMemoryStore()
+	subnet := netip.MustParsePrefix("10.0.0.0/24")
+	_, err := store.UpdateHost(context.Background(), state.HostRecord{
+		IP:       netip.MustParseAddr("10.0.0.1"),
+		LastSeen: time.Now(),
+		Alive:    true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := newTestPortScanner(store, map[string][]uint16{subnet.String(): {80}}, nil)
+	ctx := withPortSnapshot(context.Background(), map[string][]uint16{})
+	results, err := p.Scan(ctx, subnet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].OpenPorts == nil || len(results[0].OpenPorts) != 0 {
+		t.Fatalf("zero-port generation must emit explicit empty observation, got %v", results)
+	}
+}
+
 func TestPortScan_EmptyStore_ReturnsNil(t *testing.T) {
 	store := state.NewMemoryStore()
 	subnet := netip.MustParsePrefix("10.0.0.0/24")
@@ -179,6 +211,40 @@ func TestPortScan_EmptyStore_ReturnsNil(t *testing.T) {
 	}
 	if results != nil {
 		t.Errorf("expected nil results for empty store, got %v", results)
+	}
+}
+
+func TestPortScan_ClosedPortsEmitExplicitEmptyResultWithoutLivenessChange(t *testing.T) {
+	store := state.NewMemoryStore()
+	subnet := netip.MustParsePrefix("127.0.0.1/32")
+	ip := netip.MustParseAddr("127.0.0.1")
+	lastSeen := time.Now().Add(-time.Hour).Round(0)
+	_, err := store.UpdateHost(context.Background(), state.HostRecord{
+		IP:       ip,
+		LastSeen: lastSeen,
+		Alive:    false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p := newTestPortScanner(store, map[string][]uint16{subnet.String(): {59999}}, nil)
+	results, err := p.Scan(context.Background(), subnet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	r := results[0]
+	if r.OpenPorts == nil || len(r.OpenPorts) != 0 {
+		t.Errorf("OpenPorts = %v, want non-nil empty slice", r.OpenPorts)
+	}
+	if r.Alive {
+		t.Errorf("port enrichment changed liveness: Alive=%t", r.Alive)
+	}
+	if !r.Timestamp.After(lastSeen) {
+		t.Errorf("port observation timestamp %s was not refreshed after %s", r.Timestamp, lastSeen)
 	}
 }
 

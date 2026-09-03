@@ -97,8 +97,9 @@ func IsWarning(err error) bool {
 }
 
 // Validate checks the configuration for logical errors. Fatal errors are
-// returned as a regular error; auth=none over https returns a *ConfigWarning
-// that callers may downgrade to a log line.
+// returned as a regular error; auth=none returns a *ConfigWarning that callers
+// may downgrade to a log line. Credential-bearing authentication always
+// requires HTTPS.
 //
 // When Enabled is false, Validate returns nil immediately — disabled remote
 // write does not require any other field to be valid.
@@ -178,42 +179,62 @@ func (a *AuthConfig) validate(endpointScheme string) error {
 		if a.CACertFile == "" || a.ClientCertFile == "" || a.ClientKeyFile == "" {
 			return fmt.Errorf("mtls auth requires ca_cert_file, client_cert_file, and client_key_file")
 		}
-		if err := mustExist(a.CACertFile, "ca_cert_file"); err != nil {
+		if err := mustBeRegular(a.CACertFile, "ca_cert_file", false); err != nil {
 			return err
 		}
-		if err := mustExist(a.ClientCertFile, "client_cert_file"); err != nil {
+		if err := mustBeRegular(a.ClientCertFile, "client_cert_file", false); err != nil {
 			return err
 		}
-		if err := mustExist(a.ClientKeyFile, "client_key_file"); err != nil {
+		if err := mustBeRegular(a.ClientKeyFile, "client_key_file", true); err != nil {
 			return err
+		}
+		if endpointScheme != "https" {
+			return fmt.Errorf("mtls auth requires an https endpoint")
 		}
 	case "bearer":
 		if a.BearerTokenFile == "" {
 			return fmt.Errorf("bearer auth requires bearer_token_file")
 		}
-		if err := mustExist(a.BearerTokenFile, "bearer_token_file"); err != nil {
+		if err := mustBeRegular(a.BearerTokenFile, "bearer_token_file", true); err != nil {
 			return err
+		}
+		if endpointScheme != "https" {
+			return fmt.Errorf("bearer auth requires an https endpoint")
 		}
 	case "basic":
 		if a.BasicUsername == "" || a.BasicPasswordFile == "" {
 			return fmt.Errorf("basic auth requires basic_username and basic_password_file")
 		}
-		if err := mustExist(a.BasicPasswordFile, "basic_password_file"); err != nil {
+		if err := mustBeRegular(a.BasicPasswordFile, "basic_password_file", true); err != nil {
 			return err
+		}
+		if endpointScheme != "https" {
+			return fmt.Errorf("basic auth requires an https endpoint")
 		}
 	case "none":
 		if endpointScheme == "https" {
 			return &ConfigWarning{msg: "auth: type=none over https is unusual — verify the receiver does not require authentication"}
 		}
+		return &ConfigWarning{msg: "auth: type=none over http sends metrics without transport encryption or receiver authentication"}
 	default:
 		return fmt.Errorf("type: must be one of \"mtls\", \"bearer\", \"basic\", \"none\", got %q", a.Type)
 	}
 	return nil
 }
 
-func mustExist(path, field string) error {
-	if _, err := os.Stat(path); err != nil {
+func mustBeRegular(path, field string, private bool) error {
+	info, err := os.Lstat(path)
+	if err != nil {
 		return fmt.Errorf("%s: %w", field, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s %q must not be a symlink", field, path)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s %q must be a regular file", field, path)
+	}
+	if private && info.Mode().Perm()&0o007 != 0 {
+		return fmt.Errorf("%s %q must not be accessible by other users", field, path)
 	}
 	return nil
 }

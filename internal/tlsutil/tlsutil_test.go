@@ -1,14 +1,20 @@
 package tlsutil_test
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
+	"math/big"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/maravexa/signet-exporter/internal/tlsutil"
 )
@@ -211,6 +217,64 @@ func TestKeypairReloader_ReloadInvalid(t *testing.T) {
 	}
 }
 
+func TestKeypairReloader_ReloadRejectsCertificateOutsideValidityWindow(t *testing.T) {
+	cs := generateTestCerts(t)
+	kr, err := tlsutil.NewKeypairReloader(cs.serverCert, cs.serverKey)
+	if err != nil {
+		t.Fatalf("NewKeypairReloader: %v", err)
+	}
+	current, _ := kr.GetCertificate(nil)
+
+	for name, validity := range map[string]struct {
+		notBefore time.Time
+		notAfter  time.Time
+	}{
+		"expired":       {notBefore: time.Now().Add(-2 * time.Hour), notAfter: time.Now().Add(-time.Hour)},
+		"not_yet_valid": {notBefore: time.Now().Add(time.Hour), notAfter: time.Now().Add(2 * time.Hour)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			writeSelfSignedServerCert(t, cs.serverCert, cs.serverKey, validity.notBefore, validity.notAfter)
+			if err := kr.Reload(); err == nil {
+				t.Fatal("Reload unexpectedly accepted an unusable replacement certificate")
+			}
+			after, _ := kr.GetCertificate(nil)
+			if after != current {
+				t.Fatal("invalid replacement certificate displaced the active keypair")
+			}
+		})
+	}
+}
+
+func writeSelfSignedServerCert(t *testing.T, certPath, keyPath string, notBefore, notAfter time.Time) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "replacement"},
+		NotBefore:    notBefore,
+		NotAfter:     notAfter,
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestKeypairReloader_ConcurrentAccess(t *testing.T) {
 	cs := generateTestCerts(t)
 	kr, err := tlsutil.NewKeypairReloader(cs.serverCert, cs.serverKey)
@@ -218,33 +282,36 @@ func TestKeypairReloader_ConcurrentAccess(t *testing.T) {
 		t.Fatalf("NewKeypairReloader: %v", err)
 	}
 
-	stop := make(chan struct{})
+	start := make(chan struct{})
 	var wg sync.WaitGroup
 
-	// 100 reader goroutines continuously calling GetCertificate.
-	for i := 0; i < 100; i++ {
+	// A finite workload still overlaps readers with reloads under the race
+	// detector without letting tight loops starve the writer on high-core hosts.
+	const (
+		readers = 32
+		reads   = 1000
+	)
+	for i := 0; i < readers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-					cert, cerr := kr.GetCertificate(nil)
-					if cerr != nil || cert == nil {
-						t.Errorf("GetCertificate: err=%v cert=%v", cerr, cert)
-					}
+			<-start
+			for j := 0; j < reads; j++ {
+				cert, cerr := kr.GetCertificate(nil)
+				if cerr != nil || cert == nil {
+					t.Errorf("GetCertificate: err=%v cert=%v", cerr, cert)
 				}
 			}
 		}()
 	}
 
 	// Reload several times from the main goroutine while readers are active.
+	close(start)
 	for i := 0; i < 5; i++ {
-		_ = kr.Reload()
+		if err := kr.Reload(); err != nil {
+			t.Fatalf("Reload: %v", err)
+		}
 	}
-	close(stop)
 	wg.Wait()
 }
 

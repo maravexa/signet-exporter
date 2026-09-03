@@ -22,8 +22,9 @@ type Queue struct {
 }
 
 type queueItem struct {
-	req     *prompb.WriteRequest
-	samples int // pre-counted at enqueue for fast accounting
+	req        *prompb.WriteRequest
+	samples    int // pre-counted at enqueue for fast accounting
+	generation uint64
 }
 
 // NewQueue returns a Queue with the given sample-count capacity.
@@ -44,19 +45,35 @@ func NewQueue(maxSamples int) *Queue {
 // signet_remote_write_samples_dropped_total{reason="queue_full"}
 // by the returned count.
 func (q *Queue) Push(req *prompb.WriteRequest) int {
+	return q.PushWithGeneration(req, 0)
+}
+
+// PushWithGeneration enqueues req with the remote-write destination generation
+// that produced it. Sender uses this to prevent a pre-reload payload from being
+// delivered to a newly configured endpoint.
+func (q *Queue) PushWithGeneration(req *prompb.WriteRequest, generation uint64) int {
 	if req == nil {
 		return 0
 	}
 	samples := countSamples(req)
-	if samples == 0 {
-		return 0
-	}
-
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if q.closed {
 		return samples
+	}
+	if samples == 0 {
+		// Preserve an empty gather as an ordered control item: the consumer
+		// needs it to emit stale markers for the last acknowledged snapshot.
+		// Coalesce consecutive empty snapshots so a sample-count-bounded queue
+		// cannot grow without bound while the receiver is slow.
+		if n := len(q.items); n > 0 && q.items[n-1].samples == 0 && q.items[n-1].generation == generation {
+			q.items[n-1].req = req
+			return 0
+		}
+		q.items = append(q.items, &queueItem{req: req, generation: generation})
+		q.cond.Signal()
+		return 0
 	}
 	if samples > q.maxSamples {
 		// Single payload exceeds total capacity — reject without modifying queue.
@@ -72,7 +89,7 @@ func (q *Queue) Push(req *prompb.WriteRequest) int {
 		q.items = q.items[1:]
 	}
 
-	q.items = append(q.items, &queueItem{req: req, samples: samples})
+	q.items = append(q.items, &queueItem{req: req, samples: samples, generation: generation})
 	q.sampleCount += samples
 	q.cond.Signal()
 	return dropped
@@ -85,6 +102,13 @@ func (q *Queue) Push(req *prompb.WriteRequest) int {
 // the cond.Wait returns even when no Push happens. The watcher exits as
 // soon as Pop returns either path.
 func (q *Queue) PopWithContext(ctx context.Context) (*prompb.WriteRequest, bool) {
+	req, _, ok := q.PopWithGeneration(ctx)
+	return req, ok
+}
+
+// PopWithGeneration is PopWithContext plus the generation assigned by
+// PushWithGeneration. A false result means closed or cancelled.
+func (q *Queue) PopWithGeneration(ctx context.Context) (*prompb.WriteRequest, uint64, bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
@@ -106,14 +130,14 @@ func (q *Queue) PopWithContext(ctx context.Context) (*prompb.WriteRequest, bool)
 		q.cond.Wait()
 	}
 	if ctx.Err() != nil || (q.closed && len(q.items) == 0) {
-		return nil, false
+		return nil, 0, false
 	}
 
 	head := q.items[0]
 	q.items[0] = nil
 	q.items = q.items[1:]
 	q.sampleCount -= head.samples
-	return head.req, true
+	return head.req, head.generation, true
 }
 
 // Len returns the current sample count in the queue.
@@ -128,6 +152,39 @@ func (q *Queue) Capacity() int {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	return q.maxSamples
+}
+
+// SetCapacity changes the sample capacity and returns samples evicted to make
+// the current contents fit. Like Push, it drops oldest payloads first. The
+// Sender calls this during a validated reload, so maxSamples is always > 0.
+func (q *Queue) SetCapacity(maxSamples int) int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	q.maxSamples = maxSamples
+	dropped := 0
+	for q.sampleCount > q.maxSamples && len(q.items) > 0 {
+		head := q.items[0]
+		dropped += head.samples
+		q.sampleCount -= head.samples
+		q.items[0] = nil
+		q.items = q.items[1:]
+	}
+	return dropped
+}
+
+// Clear discards every queued payload and returns its total sample count.
+// It deliberately leaves capacity and closed state unchanged.
+func (q *Queue) Clear() int {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	dropped := q.sampleCount
+	for i := range q.items {
+		q.items[i] = nil
+	}
+	q.items = nil
+	q.sampleCount = 0
+	return dropped
 }
 
 // Close marks the queue as closed and wakes any blocked PopWithContext.

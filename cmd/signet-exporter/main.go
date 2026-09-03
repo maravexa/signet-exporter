@@ -10,6 +10,8 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"reflect"
+	"sync"
 	"syscall"
 	"time"
 
@@ -222,6 +224,12 @@ func main() {
 
 	signetCollector := collector.NewSignetCollector(store, prefixes, logger)
 	sched := scanner.NewScheduler(scanners, store, subnetConfigs, cfg.Scanner.MaxParallelScans, logger, ouiDB, auditLogger, allowlists, effectiveHostTTL(config.ExtractReloadable(cfg)))
+	// Seed the scheduler's cycle-owned port snapshot and prune persisted expiry
+	// before any collector scrape or remote-write gather can observe inventory.
+	sched.ApplyConfigWithHook(scanner.ApplyConfigParams{Subnets: subnetConfigs, Allowlists: allowlists, Ports: subnetPorts, HostTTL: effectiveHostTTL(config.ExtractReloadable(cfg))}, func(generation uint64) {
+		signetCollector.ApplyConfig(collector.Config{Generation: generation, Subnets: collectorSubnets(subnetConfigs, allowlists)})
+	})
+	sched.PrepareStartup()
 
 	if cfg.TLS.CertFile == "" {
 		logger.Warn("TLS not configured — serving metrics over plaintext HTTP; not recommended for production")
@@ -235,6 +243,7 @@ func main() {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	var backgroundWG sync.WaitGroup
 
 	// Optional remote write push pipeline. Coexists with the /metrics scrape
 	// endpoint — operators in mixed environments may push to a long-term store
@@ -251,7 +260,9 @@ func main() {
 			logger.Error("failed to initialize remote write sender", "err", err)
 			os.Exit(1)
 		}
+		backgroundWG.Add(1)
 		go func() {
+			defer backgroundWG.Done()
 			if rerr := rwSender.Run(ctx); rerr != nil && ctx.Err() == nil {
 				logger.Error("remote write sender exited unexpectedly", "err", rerr)
 			}
@@ -267,7 +278,10 @@ func main() {
 	{
 		sighup := make(chan os.Signal, 1)
 		signal.Notify(sighup, syscall.SIGHUP)
+		backgroundWG.Add(1)
 		go func() {
+			defer signal.Stop(sighup)
+			defer backgroundWG.Done()
 			for {
 				select {
 				case <-ctx.Done():
@@ -277,13 +291,25 @@ func main() {
 					newCfg, cfgErr := config.LoadConfig(*configPath)
 					if cfgErr != nil {
 						logger.Error("SIGHUP: failed to read config file — keeping old config", "err", cfgErr)
+					} else if valErr := config.Validate(newCfg); valErr != nil && !remotewrite.IsWarning(valErr) {
+						// Validate the complete candidate before considering its mutable
+						// subset. Otherwise an invalid immutable setting could be silently
+						// ignored while unrelated mutable settings were activated.
+						logger.Error("SIGHUP: new config failed full validation — keeping old config", "err", valErr)
+					} else if immutableChanges := immutableConfigChanges(cfg, newCfg); len(immutableChanges) > 0 {
+						// TLS key material may rotate at the existing paths below, but
+						// changing any TLS setting itself (or another immutable field)
+						// needs a restart. Reject the entire application generation.
+						logger.Warn("SIGHUP: immutable config changed; restart required — keeping old generation", "fields", immutableChanges)
 					} else {
 						newRC := config.ExtractReloadable(newCfg)
 						if valErr := config.ValidateReloadable(newRC); valErr != nil {
 							logger.Error("SIGHUP: new config failed validation — keeping old config", "err", valErr)
 						} else {
 							changes := config.Diff(currentRC, newRC)
-							if len(changes) > 0 {
+							// Always rebuild and activate a candidate: an allowlist may
+							// change contents without its configured path changing.
+							{
 								// Load new allowlists from updated file paths.
 								newAllowlists := make(map[string]*scanner.Allowlist)
 								loadErr := false
@@ -317,13 +343,6 @@ func main() {
 											ScanInterval: interval,
 										})
 									}
-									sched.ApplyConfig(scanner.ApplyConfigParams{
-										Subnets:    newSubnets,
-										Allowlists: newAllowlists,
-										HostTTL:    effectiveHostTTL(newRC),
-									})
-
-									// Update port scanner with new per-subnet ports.
 									newSubnetPorts := make(map[string][]uint16)
 									for _, s := range newRC.Subnets {
 										if len(s.Ports) == 0 {
@@ -332,21 +351,51 @@ func main() {
 										prefix, _ := netip.ParsePrefix(s.CIDR)
 										ports := make([]uint16, len(s.Ports))
 										for i, p := range s.Ports {
-											ports[i] = uint16(p) //nolint:gosec // port validated 1–65535
+											ports[i] = uint16(p) //nolint:gosec // validated by reload candidate
 										}
 										newSubnetPorts[prefix.String()] = ports
 									}
-									portScanner.UpdatePorts(newSubnetPorts)
+									// Remote-write must accept the candidate before any other
+									// component activates it; otherwise a bad remote candidate
+									// could leave a partially applied reload generation.
+									remoteAccepted := true
+									if rwSender == nil && newCfg.RemoteWrite.Enabled != cfg.RemoteWrite.Enabled {
+										logger.Warn("SIGHUP: remote_write enable toggle requires restart; keeping generation")
+										remoteAccepted = false
+									}
+									if rwSender != nil {
+										if vErr := newCfg.RemoteWrite.Validate(); vErr != nil && !remotewrite.IsWarning(vErr) {
+											logger.Error("SIGHUP: remote_write config invalid — keeping generation", "err", vErr)
+											remoteAccepted = false
+										}
+										if remoteAccepted {
+											if rerr := rwSender.Reload(newCfg.RemoteWrite); rerr != nil {
+												logger.Error("SIGHUP: remote_write reload failed — keeping generation", "err", rerr)
+												remoteAccepted = false
+											}
+										}
+										if remoteAccepted {
+											cfg.RemoteWrite = newCfg.RemoteWrite
+										}
+									}
+									if remoteAccepted {
+										sched.ApplyConfigWithHook(scanner.ApplyConfigParams{
+											Subnets:    newSubnets,
+											Allowlists: newAllowlists,
+											Ports:      newSubnetPorts,
+											HostTTL:    effectiveHostTTL(newRC),
+										}, func(generation uint64) {
+											signetCollector.ApplyConfig(collector.Config{Generation: generation, Subnets: collectorSubnets(newSubnets, newAllowlists)})
+										})
 
-									currentRC = newRC
-									auditLogger.ConfigReloaded(changes)
-									logger.Info("SIGHUP: config reloaded", "changes", len(changes))
-									for _, c := range changes {
-										logger.Info("SIGHUP: change", "detail", c)
+										currentRC = newRC
+										auditLogger.ConfigReloaded(changes)
+										logger.Info("SIGHUP: config reloaded", "changes", len(changes))
+										for _, c := range changes {
+											logger.Info("SIGHUP: change", "detail", c)
+										}
 									}
 								}
-							} else {
-								logger.Info("SIGHUP: config unchanged")
 							}
 						}
 					}
@@ -362,32 +411,15 @@ func main() {
 						}
 					}
 
-					// --- Remote write hot-reload ---
-					if rwSender != nil {
-						newCfg, cfgErr := config.LoadConfig(*configPath)
-						if cfgErr == nil {
-							if vErr := newCfg.RemoteWrite.Validate(); vErr != nil && !remotewrite.IsWarning(vErr) {
-								logger.Error("SIGHUP: remote_write config invalid — keeping old config", "err", vErr)
-							} else if rerr := rwSender.Reload(newCfg.RemoteWrite); rerr != nil {
-								if rerr == remotewrite.ErrEnableToggleRequiresRestart {
-									logger.Warn("SIGHUP: remote_write enable toggle ignored — restart required",
-										"old", cfg.RemoteWrite.Enabled, "new", newCfg.RemoteWrite.Enabled)
-								} else {
-									logger.Error("SIGHUP: remote_write reload failed", "err", rerr)
-								}
-							} else {
-								// Track the cfg for the next reload's audit-log diff context.
-								cfg.RemoteWrite = newCfg.RemoteWrite
-							}
-						}
-					}
 				}
 			}
 		}()
 	}
 
 	// Start the scheduler in the background.
+	backgroundWG.Add(1)
 	go func() {
+		defer backgroundWG.Done()
 		if err := sched.Run(ctx); err != nil && ctx.Err() == nil {
 			logger.Error("scheduler exited unexpectedly", "err", err)
 		}
@@ -422,6 +454,9 @@ func main() {
 			logger.Error("server error", "err", err)
 		}
 	}
+	// Stop all producer loops before closing the store or audit logger. This is
+	// also required when the HTTP server, rather than a signal, ended the select.
+	cancel()
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -429,30 +464,88 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("server shutdown error", "err", err)
 	}
+	backgroundWG.Wait()
 
 	logger.Info("signet-exporter stopped")
 }
 
-// effectiveHostTTL returns the configured HostTTL from a ReloadableConfig, or a
-// default of 3× the minimum scan interval across all subnets if HostTTL is zero.
-// Returns 0 (disabled) only when no subnets are configured.
+func collectorSubnets(subnets []scanner.SubnetConfig, allowlists map[string]*scanner.Allowlist) []collector.SubnetConfig {
+	out := make([]collector.SubnetConfig, len(subnets))
+	for i, subnet := range subnets {
+		scope := ""
+		if allowlist := allowlists[subnet.Prefix.String()]; allowlist != nil {
+			scope = allowlist.Scope()
+		}
+		out[i] = collector.SubnetConfig{Prefix: subnet.Prefix, ScanInterval: subnet.ScanInterval, AuthorizationScope: scope}
+	}
+	return out
+}
+
+// immutableConfigChanges reports configuration fields that cannot be safely
+// applied to a running process. Certificate contents are deliberately not
+// compared here: the reloader below handles same-path TLS rotation on every
+// SIGHUP.
+func immutableConfigChanges(old, candidate *config.Config) []string {
+	changes := make([]string, 0, 7)
+	if old.ListenAddress != candidate.ListenAddress {
+		changes = append(changes, "listen_address")
+	}
+	if old.TLS != candidate.TLS {
+		changes = append(changes, "tls")
+	}
+	if !reflect.DeepEqual(old.DNS, candidate.DNS) {
+		changes = append(changes, "dns")
+	}
+	if old.Scanner != candidate.Scanner {
+		changes = append(changes, "scanner")
+	}
+	if old.State != candidate.State {
+		changes = append(changes, "state")
+	}
+	if old.OUIDatabase != candidate.OUIDatabase {
+		changes = append(changes, "oui_database")
+	}
+	if old.Audit != candidate.Audit {
+		changes = append(changes, "audit")
+	}
+	return changes
+}
+
+// maxConfiguredPortCount remains for compatibility with callers that estimate
+// capacity from configuration. Runtime metrics now derive active series from
+// the exact collector output instead.
+func maxConfiguredPortCount(subnets []config.SubnetConfig) int {
+	maxCount := 0
+	for _, subnet := range subnets {
+		if len(subnet.Ports) > maxCount {
+			maxCount = len(subnet.Ports)
+		}
+	}
+	return maxCount
+}
+
+// effectiveHostTTL returns an explicitly configured HostTTL, including an
+// explicit zero that disables eviction. When host_ttl is omitted, the
+// conservative default is 3× the longest configured scan interval: a host on
+// a slower subnet must not expire while that subnet is scanning normally.
+// Returns 0 only when no subnets are configured.
 func effectiveHostTTL(rc config.ReloadableConfig) time.Duration {
-	if rc.HostTTL > 0 {
+	if rc.HostTTLSet {
 		return rc.HostTTL
 	}
-	// Compute 3× the minimum scan interval as the default TTL.
-	var minInterval time.Duration
+	// Compute 3× the maximum scan interval as the conservative global default.
+	var maxInterval time.Duration
 	for _, s := range rc.Subnets {
 		interval := s.ScanInterval
 		if interval == 0 {
 			interval = 60 * time.Second
 		}
-		if minInterval == 0 || interval < minInterval {
-			minInterval = interval
+		if interval > maxInterval {
+			maxInterval = interval
 		}
 	}
-	if minInterval == 0 {
+	if maxInterval == 0 {
 		return 0
 	}
-	return 3 * minInterval
+	return 3 * maxInterval
 }

@@ -30,7 +30,7 @@ func NewMetrics() *Metrics {
 
 		SamplesDropped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "signet_remote_write_samples_dropped_total",
-			Help: "Total number of samples dropped before delivery. reason: queue_full | conversion_error | fatal_response.",
+			Help: "Total number of samples dropped before delivery. reason: queue_full | conversion_error | fatal_response | endpoint_changed.",
 		}, []string{"endpoint", "reason"}),
 
 		SendDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{

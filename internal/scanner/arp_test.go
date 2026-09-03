@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 )
 
 // makeMAC parses a MAC string for use in tests.
@@ -291,6 +292,92 @@ func TestGroupARPReplies_NoDuplicates(t *testing.T) {
 	}
 }
 
+func TestCollectARPReplies_DoesNotTruncateLargeReplyStream(t *testing.T) {
+	const replies = 300
+	ch := make(chan ScanResult)
+	done := make(chan []ScanResult, 1)
+	go func() { done <- collectARPResults(ch) }()
+
+	for i := 0; i < replies; i++ {
+		ch <- ScanResult{
+			IP:        netip.AddrFrom4([4]byte{10, 20, byte(i / 254), byte(i%254 + 1)}),
+			MAC:       net.HardwareAddr{0x02, 0, 0, 0, byte(i / 256), byte(i)},
+			Timestamp: time.Now(),
+		}
+	}
+	close(ch)
+
+	got := <-done
+	if len(got) != replies {
+		t.Fatalf("collected %d replies, want %d; replies must not be silently truncated", len(got), replies)
+	}
+}
+
+func TestGroupARPReplies_CapsDuplicateClaimants(t *testing.T) {
+	ip := netip.MustParseAddr("10.0.0.50")
+	replies := make([]arpReply, 0, maxDuplicateMACsPerIP+5)
+	for i := 0; i < maxDuplicateMACsPerIP+5; i++ {
+		replies = append(replies, arpReply{
+			IP:  ip,
+			MAC: net.HardwareAddr{0x02, 0, 0, 0, byte(i >> 8), byte(i)},
+		})
+	}
+	results := groupARPReplies(replies)
+	if len(results) != 1 {
+		t.Fatalf("results = %d, want 1", len(results))
+	}
+	if got := len(results[0].DuplicateMACs); got != maxDuplicateMACsPerIP {
+		t.Fatalf("duplicate MACs = %d, want cap %d", got, maxDuplicateMACsPerIP)
+	}
+	if results[0].Metadata["duplicate_claimants_truncated"] != "true" {
+		t.Fatalf("overflow was not surfaced: %v", results[0].Metadata)
+	}
+}
+
+func TestGroupARPReplies_ConflictSelectionIsDeterministicAcrossArrivalOrder(t *testing.T) {
+	ip := netip.MustParseAddr("10.0.0.51")
+	claims := make([]arpReply, 0, maxDuplicateMACsPerIP+5)
+	for i := maxDuplicateMACsPerIP + 4; i >= 0; i-- {
+		claims = append(claims, arpReply{
+			IP:  ip,
+			MAC: net.HardwareAddr{0x02, 0, 0, 0, byte(i >> 8), byte(i)},
+		})
+	}
+	reversed := make([]arpReply, len(claims))
+	for i := range claims {
+		reversed[len(claims)-1-i] = claims[i]
+	}
+
+	forwardResult := groupARPReplies(claims)
+	reverseResult := groupARPReplies(reversed)
+	if len(forwardResult) != 1 || len(reverseResult) != 1 {
+		t.Fatalf("unexpected grouped result counts: %d and %d", len(forwardResult), len(reverseResult))
+	}
+	forward, reverse := forwardResult[0], reverseResult[0]
+	if !equalMAC(forward.MAC, reverse.MAC) {
+		t.Fatalf("primary depends on arrival order: %v vs %v", forward.MAC, reverse.MAC)
+	}
+	wantPrimary := net.HardwareAddr{0x02, 0, 0, 0, 0, 0}
+	if !equalMAC(forward.MAC, wantPrimary) {
+		t.Fatalf("primary = %v, want lexicographically lowest %v", forward.MAC, wantPrimary)
+	}
+	if len(forward.DuplicateMACs) != len(reverse.DuplicateMACs) {
+		t.Fatalf("duplicate count depends on arrival order: %d vs %d", len(forward.DuplicateMACs), len(reverse.DuplicateMACs))
+	}
+	for i := range forward.DuplicateMACs {
+		if !equalMAC(forward.DuplicateMACs[i], reverse.DuplicateMACs[i]) {
+			t.Fatalf("duplicate %d depends on arrival order: %v vs %v", i, forward.DuplicateMACs[i], reverse.DuplicateMACs[i])
+		}
+		want := net.HardwareAddr{0x02, 0, 0, 0, 0, byte(i + 1)}
+		if !equalMAC(forward.DuplicateMACs[i], want) {
+			t.Fatalf("duplicate %d = %v, want retained lowest claimant %v", i, forward.DuplicateMACs[i], want)
+		}
+	}
+	if forward.Metadata["duplicate_claimants_truncated"] != "true" || reverse.Metadata["duplicate_claimants_truncated"] != "true" {
+		t.Fatalf("truncation not surfaced consistently: %v vs %v", forward.Metadata, reverse.Metadata)
+	}
+}
+
 func TestGroupARPReplies_DuplicateDetected(t *testing.T) {
 	mac1 := makeMAC("aa:bb:cc:dd:ee:01")
 	mac2 := makeMAC("ff:ee:dd:cc:bb:aa")
@@ -310,7 +397,7 @@ func TestGroupARPReplies_DuplicateDetected(t *testing.T) {
 		t.Error("DuplicateChecked must be true")
 	}
 	if !equalMAC(r.MAC, mac1) {
-		t.Errorf("primary MAC = %v, want %v (first respondent wins)", r.MAC, mac1)
+		t.Errorf("primary MAC = %v, want lexicographically lowest %v", r.MAC, mac1)
 	}
 	if len(r.DuplicateMACs) != 1 {
 		t.Fatalf("DuplicateMACs len = %d, want 1", len(r.DuplicateMACs))
@@ -367,16 +454,8 @@ func TestGroupARPReplies_ThreeMACs_SameIP(t *testing.T) {
 	if len(r.DuplicateMACs) != 2 {
 		t.Fatalf("DuplicateMACs len = %d, want 2", len(r.DuplicateMACs))
 	}
-	// Both mac2 and mac3 must appear in DuplicateMACs (order not guaranteed).
-	found := map[string]bool{}
-	for _, dm := range r.DuplicateMACs {
-		found[dm.String()] = true
-	}
-	if !found[mac2.String()] {
-		t.Errorf("mac2 (%v) not in DuplicateMACs", mac2)
-	}
-	if !found[mac3.String()] {
-		t.Errorf("mac3 (%v) not in DuplicateMACs", mac3)
+	if !equalMAC(r.DuplicateMACs[0], mac2) || !equalMAC(r.DuplicateMACs[1], mac3) {
+		t.Errorf("DuplicateMACs = %v, want deterministically sorted [%v %v]", r.DuplicateMACs, mac2, mac3)
 	}
 }
 

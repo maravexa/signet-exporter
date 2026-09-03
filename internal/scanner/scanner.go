@@ -8,6 +8,14 @@ import (
 	"time"
 )
 
+// maxDuplicateMACsPerIP bounds retained ARP conflict evidence per address.
+// It is defined outside the Linux ARP implementation so runtime reporting
+// remains portable.
+const maxDuplicateMACsPerIP = 16
+
+// maxDNSNamesPerHost bounds DNS-derived labels and mismatch evidence per host.
+const maxDNSNamesPerHost = 32
+
 // Scanner is the interface that all network probe implementations must satisfy.
 type Scanner interface {
 	// Name returns a short identifier for the scanner (e.g., "arp", "icmp").
