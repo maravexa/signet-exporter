@@ -327,9 +327,13 @@ func TestSender_ReloadKeepsClientOnExpiredCertificateRotation(t *testing.T) {
 	if err := tlsutil.GenerateCerts(dir); err != nil {
 		t.Fatal(err)
 	}
-	cfg := Config{Enabled: true, Endpoint: "https://receiver.example.invalid/api/v1/write", Interval: time.Second, Timeout: 500 * time.Millisecond,
-		Queue: QueueConfig{MaxSamples: 10, Overflow: "drop_oldest"}, Auth: AuthConfig{Type: "mtls",
-			CACertFile: filepath.Join(dir, "ca.pem"), ClientCertFile: filepath.Join(dir, "client.pem"), ClientKeyFile: filepath.Join(dir, "client-key.pem")}}
+	cfg := Config{
+		Enabled: true, Endpoint: "https://receiver.example.invalid/api/v1/write", Interval: time.Second, Timeout: 500 * time.Millisecond,
+		Queue: QueueConfig{MaxSamples: 10, Overflow: "drop_oldest"}, Auth: AuthConfig{
+			Type:       "mtls",
+			CACertFile: filepath.Join(dir, "ca.pem"), ClientCertFile: filepath.Join(dir, "client.pem"), ClientKeyFile: filepath.Join(dir, "client-key.pem"),
+		},
+	}
 	sender, err := NewSender(cfg, &stubGatherer{families: gatherFamily()}, NewMetrics(), nil, audit.Disabled(), "test")
 	if err != nil {
 		t.Fatal(err)
@@ -354,8 +358,10 @@ func writeClientCertWithValidity(t *testing.T, certPath, keyPath string, notBefo
 	if err != nil {
 		t.Fatal(err)
 	}
-	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test-client"},
-		NotBefore: notBefore, NotAfter: notAfter, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "test-client"},
+		NotBefore: notBefore, NotAfter: notAfter, KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
 		t.Fatal(err)
@@ -520,8 +526,10 @@ func TestSender_ReloadEndpointDropsOldDestinationBatches(t *testing.T) {
 	}))
 	defer serverTwo.Close()
 
-	cfg := Config{Enabled: true, Endpoint: "http://old.example.invalid/write", Interval: time.Second, Timeout: time.Second,
-		Queue: QueueConfig{MaxSamples: 10, Overflow: "drop_oldest"}, Auth: AuthConfig{Type: "none"}}
+	cfg := Config{
+		Enabled: true, Endpoint: "http://old.example.invalid/write", Interval: time.Second, Timeout: time.Second,
+		Queue: QueueConfig{MaxSamples: 10, Overflow: "drop_oldest"}, Auth: AuthConfig{Type: "none"},
+	}
 	metrics := NewMetrics()
 	sender, err := NewSender(cfg, &stubGatherer{families: gatherFamily()}, metrics, nil, audit.Disabled(), "test")
 	if err != nil {
@@ -608,8 +616,10 @@ func TestSender_ProducesStaleMarkerForDisappearedSeries(t *testing.T) {
 }
 
 func TestSender_RegeneratesStaleMarkerAfterDroppedBatch(t *testing.T) {
-	cfg := Config{Enabled: true, Endpoint: "http://receiver.example.invalid/write", Interval: time.Second, Timeout: time.Second,
-		Queue: QueueConfig{MaxSamples: 10, Overflow: "drop_oldest"}, Auth: AuthConfig{Type: "none"}}
+	cfg := Config{
+		Enabled: true, Endpoint: "http://receiver.example.invalid/write", Interval: time.Second, Timeout: time.Second,
+		Queue: QueueConfig{MaxSamples: 10, Overflow: "drop_oldest"}, Auth: AuthConfig{Type: "none"},
+	}
 	gatherer := &stubGatherer{families: gatherFamily()}
 	sender, err := NewSender(cfg, gatherer, NewMetrics(), nil, audit.Disabled(), "test")
 	if err != nil {
@@ -657,8 +667,10 @@ func TestSender_QueuedSnapshotsComputeStalenessAtDelivery(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := Config{Enabled: true, Endpoint: srv.URL, Interval: time.Second, Timeout: time.Second,
-		Queue: QueueConfig{MaxSamples: 10, Overflow: "drop_oldest"}, Auth: AuthConfig{Type: "none"}}
+	cfg := Config{
+		Enabled: true, Endpoint: srv.URL, Interval: time.Second, Timeout: time.Second,
+		Queue: QueueConfig{MaxSamples: 10, Overflow: "drop_oldest"}, Auth: AuthConfig{Type: "none"},
+	}
 	sender, err := NewSender(cfg, &stubGatherer{}, NewMetrics(), nil, audit.Disabled(), "test")
 	if err != nil {
 		t.Fatal(err)
