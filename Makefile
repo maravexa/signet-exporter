@@ -22,7 +22,7 @@ build:
 ## build-fips: compile the BoringCrypto variant (not a certification claim)
 build-fips:
 	@mkdir -p $(DIST)
-	GOEXPERIMENT=boringcrypto go build -trimpath -ldflags "$(LDFLAGS)" \
+	CGO_ENABLED=1 GOEXPERIMENT=boringcrypto go build -trimpath -ldflags "$(LDFLAGS)" \
 		-o $(DIST)/$(BINARY)-fips $(CMD)
 
 ## test: run the full test suite

@@ -301,7 +301,7 @@ func TestCollectARPReplies_DoesNotTruncateLargeReplyStream(t *testing.T) {
 	for i := 0; i < replies; i++ {
 		ch <- ScanResult{
 			IP:        netip.AddrFrom4([4]byte{10, 20, byte(i / 254), byte(i%254 + 1)}),
-			MAC:       net.HardwareAddr{0x02, 0, 0, 0, byte(i / 256), byte(i)},
+			MAC:       net.HardwareAddr{0x02, 0, 0, 0, byte((i / 256) & 0xff), byte(i & 0xff)},
 			Timestamp: time.Now(),
 		}
 	}

@@ -410,7 +410,9 @@ func TestSender_ReloadPublishesNewEndpointAndExternalLabels(t *testing.T) {
 		t.Fatalf("Reload: %v", err)
 	}
 	deadline = time.Now().Add(2 * time.Second)
-	for second.Load() == 0 && time.Now().Before(deadline) {
+	// Receiving the request precedes the client processing its response and
+	// publishing the success metric; wait for both observations.
+	for (second.Load() == 0 || readCounterVec(metrics.SamplesSent, serverTwo.URL) == 0) && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if second.Load() == 0 {

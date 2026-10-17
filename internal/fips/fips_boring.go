@@ -2,5 +2,7 @@
 
 package fips
 
-// Enabled returns true: this binary was compiled with GOEXPERIMENT=boringcrypto.
-func Enabled() bool { return true }
+import "crypto/boring"
+
+// Enabled reports whether BoringCrypto handles supported crypto operations.
+func Enabled() bool { return boring.Enabled() }

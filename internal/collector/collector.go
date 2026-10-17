@@ -160,7 +160,7 @@ func NewSignetCollector(store state.Store, subnets []netip.Prefix, logger *slog.
 		),
 		fipsEnabled: prometheus.NewDesc(
 			"signet_exporter_fips_enabled",
-			"1 if the binary was compiled with BoringCrypto (GOEXPERIMENT=boringcrypto), 0 otherwise.",
+			"1 if BoringCrypto handles supported crypto operations, 0 otherwise; not a certification indicator.",
 			nil, nil,
 		),
 	}

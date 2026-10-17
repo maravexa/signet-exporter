@@ -426,9 +426,9 @@ func main() {
 	}()
 
 	if fips.Enabled() {
-		logger.Info("FIPS mode enabled")
+		logger.Info("BoringCrypto backend enabled (not a certification indicator)")
 	} else {
-		logger.Info("FIPS mode not enabled (standard crypto)")
+		logger.Info("BoringCrypto backend not enabled")
 	}
 
 	logger.Info("starting signet-exporter",

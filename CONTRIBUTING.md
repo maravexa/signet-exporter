@@ -4,7 +4,7 @@ Thank you for your interest in contributing. This document outlines the developm
 
 ## Development Prerequisites
 
-- Go 1.22+
+- Go 1.26+ (use the latest patched Go release; validated with Go 1.26.9)
 - `golangci-lint` (for linting)
 - `make`
 

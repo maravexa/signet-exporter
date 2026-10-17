@@ -146,8 +146,8 @@ const (
 
 // tag returns the wire-format tag byte sequence for (fieldNumber, wireType).
 // All field numbers used here are < 16 so a single byte suffices.
-func tag(fieldNumber, wireType int) byte {
-	return byte(fieldNumber<<3 | wireType)
+func tag(fieldNumber, wireType byte) byte {
+	return fieldNumber<<3 | wireType
 }
 
 // appendVarint appends x to buf in little-endian base-128 varint encoding.

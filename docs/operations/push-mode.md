@@ -86,12 +86,16 @@ certification claim.
 **TLS for the remote write client uses Go's stdlib `crypto/tls`.** The remote
 write client and `/metrics` listener use the same Go TLS implementation. A
 `GOEXPERIMENT=boringcrypto` build therefore applies the selected toolchain
-mode to both paths; validate the resulting binary and receiver configuration
+backend to supported operations in both paths. Backend availability does not enforce
+an approved-only TLS policy (Signet does not import `crypto/tls/fipsonly`); validate
+the resulting binary and receiver configuration
 in your deployment.
 
 **`signet_exporter_fips_enabled` is the runtime build indicator.** It reports
-`1` when the binary was built with BoringCrypto active. It indicates the build
-mode, not deployment certification. Query it from `/metrics`:
+`1` when `crypto/boring.Enabled()` confirms that BoringCrypto handles supported
+crypto operations. It is `0` when CGO is disabled, even if the `boringcrypto` build
+tag is set. This indicator does not report Go native FIPS 140-3 mode or establish
+deployment certification. Query it from `/metrics`:
 
 ```
 signet_exporter_fips_enabled 1
