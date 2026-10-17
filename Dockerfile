@@ -3,7 +3,7 @@
 # Stage 1 builds the binary; stage 2 produces a minimal nonroot image.
 
 # ── Build stage ──────────────────────────────────────────────────────────────
-FROM golang:1.22-bookworm AS builder
+FROM golang:1.26.9-bookworm AS builder
 
 WORKDIR /src
 

@@ -1,4 +1,4 @@
-// Package fips provides runtime FIPS mode detection.
-// Enabled returns true when the binary was compiled with BoringCrypto
-// (GOEXPERIMENT=boringcrypto). In standard builds it is always false.
+// Package fips reports whether the BoringCrypto backend handles supported crypto
+// operations. This indicator does not establish FIPS certification or enforce an
+// approved-only TLS policy. It does not report Go native FIPS 140-3 mode.
 package fips

@@ -483,18 +483,32 @@ func (j *jsonBackend) CertReloaded(certPath string, certErr error) {
 // noopBackend discards all events. Used by Disabled().
 type noopBackend struct{}
 
-func (noopBackend) NewHost(net.IP, string, net.HardwareAddr, string, string)                       {}
+func (noopBackend) NewHost(net.IP, string, net.HardwareAddr, string, string) {}
+
 func (noopBackend) MACIPChange(net.IP, string, net.HardwareAddr, net.HardwareAddr, string, string) {}
-func (noopBackend) HostDisappeared(net.IP, string, net.HardwareAddr, string, time.Time)            {}
-func (noopBackend) HostExpired(string, string, time.Time)                                          {}
-func (noopBackend) UnauthorizedDevice(net.IP, string, net.HardwareAddr, string)                    {}
-func (noopBackend) DuplicateIP(net.IP, string, net.HardwareAddr, []net.HardwareAddr)               {}
-func (noopBackend) ScanCycleComplete(string, int, time.Duration, []string)                         {}
-func (noopBackend) ScanCompleted(string, string, time.Duration, int)                               {}
-func (noopBackend) ScanError(string, string, error)                                                {}
-func (noopBackend) ConfigReloaded([]string)                                                        {}
-func (noopBackend) CertReloaded(string, error)                                                     {}
-func (noopBackend) RemoteWriteStarted(string, string)                                              {}
-func (noopBackend) RemoteWriteEndpointUnreachable(string, time.Duration, string)                   {}
-func (noopBackend) RemoteWriteConfigReloaded([]string)                                             {}
-func (noopBackend) RemoteWriteRecovered(string, time.Duration)                                     {}
+
+func (noopBackend) HostDisappeared(net.IP, string, net.HardwareAddr, string, time.Time) {}
+
+func (noopBackend) HostExpired(string, string, time.Time) {}
+
+func (noopBackend) UnauthorizedDevice(net.IP, string, net.HardwareAddr, string) {}
+
+func (noopBackend) DuplicateIP(net.IP, string, net.HardwareAddr, []net.HardwareAddr) {}
+
+func (noopBackend) ScanCycleComplete(string, int, time.Duration, []string) {}
+
+func (noopBackend) ScanCompleted(string, string, time.Duration, int) {}
+
+func (noopBackend) ScanError(string, string, error) {}
+
+func (noopBackend) ConfigReloaded([]string) {}
+
+func (noopBackend) CertReloaded(string, error) {}
+
+func (noopBackend) RemoteWriteStarted(string, string) {}
+
+func (noopBackend) RemoteWriteEndpointUnreachable(string, time.Duration, string) {}
+
+func (noopBackend) RemoteWriteConfigReloaded([]string) {}
+
+func (noopBackend) RemoteWriteRecovered(string, time.Duration) {}

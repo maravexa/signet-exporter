@@ -175,9 +175,11 @@ func TestKeypairReloader_Reload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// #nosec G703 -- cs.serverCert is a fixture path generated under t.TempDir(), not external input.
 	if err := os.WriteFile(cs.serverCert, newCert, 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// #nosec G703 -- cs.serverKey is a fixture path generated under t.TempDir(), not external input.
 	if err := os.WriteFile(cs.serverKey, newKey, 0o600); err != nil {
 		t.Fatal(err)
 	}

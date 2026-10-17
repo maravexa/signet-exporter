@@ -472,8 +472,8 @@ func TestConcurrency(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ip := netip.AddrFrom4([4]byte{10, 5, byte(i / 256), byte(i % 256)})
-			mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, byte(i >> 8), byte(i)}
+			ip := netip.AddrFrom4([4]byte{10, 5, byte((i / 256) & 0xff), byte(i & 0xff)})
+			mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, byte((i >> 8) & 0xff), byte(i & 0xff)}
 			rec := HostRecord{
 				IP:       ip,
 				MAC:      mac,
