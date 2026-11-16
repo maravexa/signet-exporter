@@ -1,6 +1,6 @@
-# Claude Code Context — signet-exporter
+# Signet Exporter contributor guide
 
-This file provides context for Claude Code sessions working on this repository.
+Repository-wide instructions for contributors and automated agents. `go.mod` declares Go 1.26.0 (the checked-in CI/FIPS workflows select 1.26.9); use its current requirement when building.
 
 ## Project Overview
 
@@ -18,13 +18,16 @@ and air-gapped environments.
 ```
 cmd/signet-exporter/   — main entry point
 internal/
-  audit/              — structured JSON audit logging
+  audit/              — structured JSON and CEF audit logging
   collector/          — Prometheus collector
   config/             — YAML config loading and validation
   oui/                — IEEE OUI database parser and lookup
   scanner/            — ARP, ICMP, DNS, port, allowlist scanners
   server/             — HTTP server for /metrics
-  state/              — bbolt and memory state backends
+  state/              — bbolt/memory state, source ownership and TTL
+  remotewrite/        — optional queue/converter/sender for push delivery
+  tlsutil/            — TLS policy and atomic certificate rotation
+  fips/               — BoringCrypto detection (not certification)
   version/            — build version injection
 pkg/netutil/          — shared network utilities
 api/v6stub/           — IPv6 stub (placeholder)
@@ -38,7 +41,7 @@ scripts/              — maintenance scripts
 
 ### Root Refusal
 
-The binary exits immediately if launched as UID 0. Use Linux capabilities or
+The normal startup path refuses UID 0 before loading configuration. Use Linux capabilities or
 `AmbientCapabilities` in systemd instead.
 
 ### State Backends
@@ -49,7 +52,7 @@ The binary exits immediately if launched as UID 0. Use Linux capabilities or
 ### OUI Lookup
 
 - Loaded once at startup from the path in `oui_database` config key.
-- Empty/missing path → degraded mode: `vendor` label is blank, no error.
+- An empty configured path returns an empty database. An unreadable non-empty path returns an error from `internal/oui.LoadDatabase`; inspect the caller for error handling rather than treating a missing file as error-free.
 - Parse format: `XX-XX-XX   (hex)    Vendor Name` lines only.
 
 ### Makefile Conventions
@@ -59,6 +62,31 @@ The binary exits immediately if launched as UID 0. Use Linux capabilities or
 - `make check` runs the full validation suite: vet + lint + test.
 
 ---
+
+## Current runtime contracts
+
+Remote write is disabled by default and can coexist with the scrape endpoint.
+`internal/remotewrite/` owns bounded queue/drop policy, encoding, credentials,
+retry and reload behavior. Enabling it sends inventory metrics to the configured
+receiver; credential-bearing authentication requires HTTPS. Keep secrets in the
+supported credential files and preserve their permission checks.
+
+`internal/state/ownership.go` merges observations by source, preserving fields
+owned by other scanners. Keep observation timestamps, host TTL and persistence
+semantics consistent across memory and bbolt; missing or expired observations are
+not affirmative evidence that every scanner found a host absent.
+
+SIGHUP validates a candidate generation before activation, rejects immutable
+setting changes that require restart, and retains the old generation on failure.
+Certificate rotation at existing paths is separate from changing TLS settings.
+Preserve this transaction across scanner, allowlist and remote-write changes.
+
+Do not infer TLS 1.3-only or mandatory mTLS from README summaries: inspect
+`internal/server/server.go`, configuration validation and `internal/tlsutil/`
+for the selected minimum/version and client-auth policy. Empty certificate
+configuration serves plaintext with a warning. `make build-fips` enables
+BoringCrypto with CGO; `internal/fips` reports actual backend availability.
+That flag and the packaging suffix do not establish FIPS certification.
 
 ## Packaging & Deployment
 
@@ -74,11 +102,11 @@ The binary exits immediately if launched as UID 0. Use Linux capabilities or
 ### OUI Database
 
 - IEEE OUI database lives at `/usr/share/signet/oui.txt` (FHS: vendor-supplied reference data).
-- The repo ships a stub in `data/oui.txt` for testing. The full database is ~500KB.
+- The repo ships a stub in `data/oui.txt` for testing. Do not infer the size or freshness of an externally downloaded database from this stub.
 - `scripts/update-oui.sh` downloads and validates a fresh copy from IEEE.
 - The update script installs to `/usr/lib/signet/update-oui.sh` (FHS: package-shipped helper scripts).
 - The exporter loads the OUI database once at startup. Restart required after updates.
-- Empty or missing `oui_database` config → degraded mode, no vendor enrichment, no error.
+- Empty `oui_database` configuration allows no enrichment; missing/unreadable files at a non-empty path are loader errors. Preserve that distinction.
 
 ### FHS File Locations
 
@@ -138,8 +166,9 @@ make validate-config
 
 ## Testing Notes
 
-- Tests use build tags to stub out raw socket operations (ARP, ICMP).
-  See `internal/scanner/arp_stub.go` and `internal/scanner/icmp_stub.go`.
-- `internal/integration_test.go` exercises the full scan pipeline.
-- OUI tests in `internal/oui/oui_test.go` use the stub `data/oui.txt`.
+- `internal/scanner/arp_stub.go` and `icmp_stub.go` use `//go:build !linux`: they are platform fallbacks, not test-only stubs on Linux.
+- `internal/integration_test.go` exercises scheduler/collector integration using mock scanners; it does not prove real ARP/ICMP reachability.
+- OUI tests in `internal/oui/oui_test.go` create temporary oui.txt fixtures and cover empty/missing files.
 - Run with `-race` flag (enabled in `make test`) — the scanner is heavily concurrent.
+
+Run commands from the repository root. `make test` runs `go test -race -count=1 ./...`; focus affected packages first. `make validate-config` builds and validates the example as a non-root user. Live scans, setcap, installation, service changes and OUI downloads are separate operational actions, not routine documentation checks. See `.github/workflows/` for CI and `.goreleaser.yaml` for package contents; this guide does not attest to live deployment or compliance certification.
